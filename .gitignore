@@ -1,0 +1,28 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.env
+
+# Build / dist
+build/
+dist/
+*.spec
+
+# Installers / binaries
+*.exe
+*.msi
+
+# Data/backups/logs
+backups/
+*.xlsx
+word_count.json
+word_counter.log
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

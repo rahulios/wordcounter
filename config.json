@@ -1,0 +1,11 @@
+{
+    "auto_save_interval": 300,
+    "daily_goal": 1000,
+    "theme": "clam",
+    "window_geometry": "700x500+156+156",
+    "show_notifications": true,
+    "backup_enabled": true,
+    "max_backup_files": 5,
+    "min_word_length": 2,
+    "wpm_history_size": 10
+}
