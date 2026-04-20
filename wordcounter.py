@@ -985,7 +985,9 @@ class DataManager:
         self.data_file = Path(data_file)
         self.backup_dir = self.data_file.parent / "backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-        self._save_lock = threading.Lock()
+        # RLock: load_writing_sessions and add_session(flush=True) call helpers that
+        # also take this lock; a plain Lock would deadlock on startup.
+        self._save_lock = threading.RLock()
         self._data_cache: Optional[pd.DataFrame] = None
         self._pending_sessions: List[Dict[str, Any]] = []
         self._dirty = False
@@ -1142,9 +1144,15 @@ class DataManager:
                     sid = f"legacy_{i}"
                 else:
                     sid = str(raw_sid).strip() or f"legacy_{i}"
-                wc = int(row.get('Word Count', 0) or 0)
-                wpm = float(row.get('WPM', 0) or 0)
-                prod = float(row.get('Productivity Score', 0) or 0)
+                wc_raw = row.get('Word Count', 0)
+                if wc_raw is None or (isinstance(wc_raw, float) and pd.isna(wc_raw)):
+                    wc = 0
+                else:
+                    wc = int(wc_raw)
+                w_raw = row.get('WPM', 0)
+                wpm = 0.0 if w_raw is None or (isinstance(w_raw, float) and pd.isna(w_raw)) else float(w_raw)
+                p_raw = row.get('Productivity Score', 0)
+                prod = 0.0 if p_raw is None or (isinstance(p_raw, float) and pd.isna(p_raw)) else float(p_raw)
                 sessions.append(WritingSession(
                     session_id=sid,
                     start_time=start_time,
