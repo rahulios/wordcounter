@@ -1684,19 +1684,22 @@ class WordCountApp:
         total = self.today_total + session_count
         self.today_count_label.config(text=f"{total} words")
         
-        # Update progress
-        progress = min((total / self.daily_goal) * 100, 100)
-        self.progress_var.set(progress)
-        self.progress_label.config(text=f"{total} / {self.daily_goal} words ({progress:.1f}%)")
+        # Update progress - allow progress to go beyond 100%
+        progress = (total / self.daily_goal) * 100
+        # Cap progress bar at 100% but show actual percentage in text
+        progress_bar_value = min(progress, 100)
+        self.progress_var.set(progress_bar_value)
         
-        # Update progress label style based on achievement
         if total >= self.daily_goal:
+            # Show actual progress beyond goal
+            self.progress_label.config(text=f"{total} / {self.daily_goal} words ({progress:.1f}%) - GOAL EXCEEDED! 🎉")
             self.progress_label.config(style="Success.TLabel")
-            self._show_goal_achievement_notification()
-        elif progress >= 75:
-            self.progress_label.config(style="Warning.TLabel")
         else:
-            self.progress_label.config(style="Stats.TLabel")
+            self.progress_label.config(text=f"{total} / {self.daily_goal} words ({progress:.1f}%)")
+            if progress >= 75:
+                self.progress_label.config(style="Warning.TLabel")
+            else:
+                self.progress_label.config(style="Stats.TLabel")
         
         # Update WPM
         wpm = self.statistics.get_overall_wpm()
@@ -1728,16 +1731,10 @@ class WordCountApp:
                 self.update_display()
     
     def _show_goal_achievement_notification(self):
-        """Show notification when daily goal is achieved."""
-        current_time = time.time()
-        if (self.config.get("show_notifications", True) and 
-            current_time - self.last_notification_time > self.notification_cooldown):
-            
-            self.last_notification_time = current_time
-            messagebox.showinfo(
-                "Goal Achieved! 🎉",
-                f"Congratulations! You've reached your daily goal of {self.daily_goal} words!"
-            )
+        """Show notification when daily goal is achieved - DISABLED to avoid interrupting writing flow."""
+        # Notification disabled to prevent interrupting the writing flow
+        # Users can see goal achievement in the progress display instead
+        pass
 
     def start_recording(self):
         """Start the recording session."""

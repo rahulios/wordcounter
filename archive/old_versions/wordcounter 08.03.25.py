@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from pynput import keyboard
@@ -2098,7 +2099,7 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         buttons_frame.pack(fill=tk.X, pady=(10, 0))
         
         def add_excluded_app():
-            app_name = tk.simpledialog.askstring("Add Application", "Enter application name (e.g., chrome.exe):")
+            app_name = simpledialog.askstring("Add Application", "Enter application name (e.g., chrome.exe):")
             if app_name:
                 self.security_manager.add_excluded_app(app_name)
                 refresh_excluded_list()
