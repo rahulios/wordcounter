@@ -5,12 +5,14 @@ from pynput import keyboard
 from pynput.keyboard import Key
 import threading
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import os
 import json
 import logging
 import re
-from typing import Optional, Dict, Any, List, Tuple
+import shutil
+import uuid
+from typing import Optional, Dict, Any, List, Tuple, Union, Deque
 from collections import deque
 import time
 from dataclasses import dataclass, field
@@ -24,9 +26,42 @@ import matplotlib
 matplotlib.use('TkAgg')  # Set backend before importing pyplot
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 import numpy as np
 from calendar import monthrange
 import seaborn as sns
+
+
+def user_data_dir() -> Path:
+    """Directory for config, data, logs (override with WORDCOUNTER_DATA_DIR for dev/tests)."""
+    override = os.environ.get("WORDCOUNTER_DATA_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "WordCounterPro"
+    return Path.home() / ".wordcounterpro"
+
+
+def migrate_legacy_data_to_app_dir(app_dir: Path) -> None:
+    """If new app dir is empty, copy config/data from current working directory once."""
+    app_dir.mkdir(parents=True, exist_ok=True)
+    cwd = Path.cwd()
+    for name in ("config.json", "WordCountData.xlsx"):
+        src, dest = cwd / name, app_dir / name
+        if src.exists() and not dest.exists():
+            try:
+                shutil.copy2(src, dest)
+            except OSError:
+                pass
+    cwd_bak, dest_bak = cwd / "backups", app_dir / "backups"
+    if cwd_bak.is_dir() and not dest_bak.exists():
+        try:
+            shutil.copytree(cwd_bak, dest_bak)
+        except OSError:
+            pass
+
 
 # Add custom exception classes
 class WordCounterError(Exception):
@@ -374,12 +409,25 @@ class AdvancedAnalytics:
         self.insights.focus_trend = insights.get("focus_trend", [])
         self.insights.productivity_trend = insights.get("productivity_trend", [])
 
+    def bulk_load_sessions(self, sessions: List[WritingSession]) -> None:
+        """Load persisted sessions without per-row achievement checks (used at startup)."""
+        # Dedupe by session_id so xlsx rows + in-memory adds do not double-count after restart
+        by_id: Dict[str, WritingSession] = {}
+        for s in sorted(sessions, key=lambda x: x.start_time):
+            by_id[s.session_id] = s
+        self.sessions = list(by_id.values())
+        self.achievements.clear()
+        self.streak = WritingStreak()
+        for s in self.sessions:
+            self._update_streak(s)
+        self._update_insights()
+
 class GoalManager:
     """Manages writing goals and progress tracking."""
     
-    def __init__(self):
+    def __init__(self, analytics: Optional[AdvancedAnalytics] = None):
         self.goals: List[WritingGoal] = []
-        self.analytics = AdvancedAnalytics()
+        self.analytics = analytics if analytics is not None else AdvancedAnalytics()
         
     def create_goal(self, goal_type: str, target_words: int, 
                    start_date: datetime, end_date: Optional[datetime] = None) -> WritingGoal:
@@ -473,49 +521,58 @@ class SecurityManager:
         self.current_app = None
         self.current_window_title = None
         self._unknown_context_warned = False
-    
-    def get_active_window_info(self) -> Tuple[str, str]:
-        """Get the current active window's process name and title."""
+        # Cache sensitive-context checks per foreground hwnd (hot path: every keystroke)
+        self._ctx_hwnd: Optional[int] = None
+        self._ctx_mono: float = 0.0
+        self._ctx_sensitive: bool = True
+
+    def _window_context_from_hwnd(self, hwnd: int) -> Tuple[str, str]:
+        """Resolve process name and lowercased window title for a native window handle."""
         try:
-            # Get the foreground window
-            hwnd = win32gui.GetForegroundWindow()
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             window_title = win32gui.GetWindowText(hwnd)
-            
-            # Get process name
             process = psutil.Process(pid)
             process_name = process.name().lower()
-            
             return process_name, window_title.lower()
         except Exception:
             return "", ""
-    
+
+    def get_active_window_info(self) -> Tuple[str, str]:
+        """Get the current active window's process name and title."""
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            return self._window_context_from_hwnd(hwnd)
+        except Exception:
+            return "", ""
+
     def is_sensitive_context(self) -> bool:
         """Check if current context is sensitive and should be excluded."""
         if not self.security_enabled:
             return False
-        
+
         try:
-            process_name, window_title = self.get_active_window_info()
+            hwnd = win32gui.GetForegroundWindow()
+            now = time.monotonic()
+            if hwnd == self._ctx_hwnd and (now - self._ctx_mono) < 1.0:
+                return self._ctx_sensitive
+
+            process_name, window_title = self._window_context_from_hwnd(hwnd)
             if not process_name or not window_title:
                 if not self._unknown_context_warned:
                     logging.warning("Unable to determine active window context; pausing counting for safety.")
                     self._unknown_context_warned = True
-                return True
-            
-            # Check if process is in excluded list
-            if process_name in self.excluded_apps:
-                return True
-            
-            # Check if window title contains sensitive keywords
-            for keyword in self.sensitive_keywords:
-                if keyword in window_title:
-                    return True
-            
-            return False
-            
+                sensitive = True
+            elif process_name in self.excluded_apps:
+                sensitive = True
+            else:
+                sensitive = any(kw in window_title for kw in self.sensitive_keywords)
+
+            self._ctx_hwnd = hwnd
+            self._ctx_mono = now
+            self._ctx_sensitive = sensitive
+            return sensitive
+
         except Exception:
-            # If we can't determine context, err on the side of caution
             return True
     
     def update_context(self) -> None:
@@ -545,7 +602,8 @@ class SessionData:
     start_time: Optional[datetime] = None
     duration: int = 0
     wpm: float = 0.0
-    words_per_minute_history: List[float] = field(default_factory=list)
+    session_id: str = ""
+    words_per_minute_history: Deque[float] = field(default_factory=deque)
     
     def reset(self) -> None:
         """Reset session data."""
@@ -553,6 +611,7 @@ class SessionData:
         self.start_time = None
         self.duration = 0
         self.wpm = 0.0
+        self.session_id = ""
         self.words_per_minute_history.clear()
 
 @dataclass
@@ -611,7 +670,7 @@ class Config:
         "wpm_history_size": 10
     }
     
-    def __init__(self, config_file: str = "config.json"):
+    def __init__(self, config_file: Union[str, Path] = "config.json"):
         self.config_file = Path(config_file)
         self.config = self.load_config()
         self._validate_config()
@@ -722,6 +781,11 @@ class Config:
 
 class WordDetector:
     """Handles word detection and counting logic with improved performance."""
+
+    _COMMON_ABBREVS = frozenset({
+        "i", "a", "an", "mr", "mrs", "dr", "prof", "etc", "vs",
+        "i.e", "e.g", "a.m", "p.m",
+    })
     
     def __init__(self, min_word_length: int = 2):
         self.current_word = ""
@@ -811,11 +875,7 @@ class WordDetector:
     
     def _is_common_abbreviation(self, word: str) -> bool:
         """Check if word is a common abbreviation that should be counted."""
-        common_abbrevs = {
-            "I", "a", "an", "Mr", "Mrs", "Dr", "Prof", "etc", "vs", "etc",
-            "i.e", "e.g", "a.m", "p.m", "A.M", "P.M"
-        }
-        return word.lower() in {abbrev.lower() for abbrev in common_abbrevs}
+        return word.lower() in self._COMMON_ABBREVS
     
     def reset(self) -> None:
         """Reset the detector state."""
@@ -829,24 +889,31 @@ class Statistics:
     def __init__(self, wpm_history_size: int = 10):
         self.session_data = SessionData()
         self.wpm_history_size = wpm_history_size
+        self.session_data.words_per_minute_history = deque(maxlen=wpm_history_size)
         self._last_update_time = 0
         self._update_interval = 0.1  # Update WPM every 100ms for better accuracy
         
     def start_session(self) -> None:
         """Start a new counting session."""
         self.session_data.reset()
+        self.session_data.words_per_minute_history = deque(maxlen=self.wpm_history_size)
         self.session_data.start_time = datetime.now()
+        self.session_data.session_id = str(uuid.uuid4())
         self._last_update_time = time.time()
-        
-    def add_word(self) -> None:
-        """Record a new word with improved WPM calculation."""
-        self.session_data.word_count += 1
+
+    def add_words(self, n: int) -> None:
+        """Increment word count by n and update WPM at most once per throttle window."""
+        if n <= 0:
+            return
+        self.session_data.word_count += n
         current_time = time.time()
-        
-        # Update WPM more frequently for better accuracy
         if current_time - self._last_update_time >= self._update_interval:
             self._update_wpm(current_time)
             self._last_update_time = current_time
+        
+    def add_word(self) -> None:
+        """Record a new word with improved WPM calculation."""
+        self.add_words(1)
     
     def _update_wpm(self, current_time: float) -> None:
         """Update WPM calculation with improved algorithm."""
@@ -857,12 +924,8 @@ class Statistics:
         if duration_minutes > 0:
             overall_wpm = self.session_data.word_count / duration_minutes
             
-            # Add to history for rolling average
+            # Add to history for rolling average (deque enforces maxlen)
             self.session_data.words_per_minute_history.append(overall_wpm)
-            
-            # Keep only the most recent entries
-            if len(self.session_data.words_per_minute_history) > self.wpm_history_size:
-                self.session_data.words_per_minute_history = self.session_data.words_per_minute_history[-self.wpm_history_size:]
             
             self.session_data.wpm = overall_wpm
     
@@ -918,10 +981,10 @@ class Statistics:
 class DataManager:
     """Manages data operations with improved error handling and performance."""
     
-    def __init__(self, data_file: str = "WordCountData.xlsx", flush_interval_seconds: int = 60):
+    def __init__(self, data_file: Union[str, Path] = "WordCountData.xlsx", flush_interval_seconds: int = 60):
         self.data_file = Path(data_file)
         self.backup_dir = self.data_file.parent / "backups"
-        self.backup_dir.mkdir(exist_ok=True)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
         self._save_lock = threading.Lock()
         self._data_cache: Optional[pd.DataFrame] = None
         self._pending_sessions: List[Dict[str, Any]] = []
@@ -929,12 +992,15 @@ class DataManager:
         self._last_flush_time = 0.0
         self._flush_interval_seconds = max(5, int(flush_interval_seconds))
         self._columns = [
+            'Session ID',
             'Date and Time',
             'Word Count',
             'Duration (seconds)',
             'WPM',
-            'Productivity Score'
+            'Productivity Score',
         ]
+        self._flush_backup_startup_done = False
+        self._last_data_backup_date: Optional[date] = None
 
     def _ensure_cache_loaded(self) -> None:
         """Load data into cache if not already loaded."""
@@ -944,6 +1010,16 @@ class DataManager:
             self._data_cache = pd.read_excel(self.data_file)
         else:
             self._data_cache = pd.DataFrame(columns=self._columns)
+        self._normalize_schema()
+
+    def _normalize_schema(self) -> None:
+        """Ensure cache has expected columns (for older xlsx files)."""
+        if self._data_cache is None:
+            return
+        if 'Session ID' not in self._data_cache.columns:
+            self._data_cache['Session ID'] = ""
+        else:
+            self._data_cache['Session ID'] = self._data_cache['Session ID'].fillna("").astype(str)
 
     def get_all_data(self, include_pending: bool = True) -> pd.DataFrame:
         """Get cached data, optionally including pending sessions."""
@@ -953,50 +1029,84 @@ class DataManager:
                 pending_df = pd.DataFrame(self._pending_sessions)
                 return pd.concat([self._data_cache, pending_df], ignore_index=True)
             return self._data_cache.copy()
-        
+
     def add_session(self, session_data: SessionData, flush: bool = False) -> bool:
-        """Add a session to the in-memory buffer, optionally flush to disk."""
-        session_row = {
+        """Upsert session row by Session ID; legacy rows with empty id still append."""
+        last_hist = (
+            session_data.words_per_minute_history[-1]
+            if len(session_data.words_per_minute_history) else 0.0
+        )
+        session_row: Dict[str, Any] = {
+            'Session ID': session_data.session_id or "",
             'Date and Time': session_data.start_time,
             'Word Count': session_data.word_count,
             'Duration (seconds)': session_data.duration,
             'WPM': session_data.wpm,
-            'Productivity Score': session_data.words_per_minute_history[-1] if session_data.words_per_minute_history else 0.0
+            'Productivity Score': last_hist,
         }
-        
+        sid = (session_data.session_id or "").strip()
+
         with self._save_lock:
-            self._pending_sessions.append(session_row)
-            self._dirty = True
+            self._ensure_cache_loaded()
+            self._normalize_schema()
+
+            if sid:
+                replaced_pending = False
+                for i, row in enumerate(self._pending_sessions):
+                    if str(row.get('Session ID', '') or '').strip() == sid:
+                        self._pending_sessions[i] = session_row
+                        replaced_pending = True
+                        self._dirty = True
+                        break
+                if not replaced_pending:
+                    found_in_cache = False
+                    if not self._data_cache.empty and 'Session ID' in self._data_cache.columns:
+                        mask = self._data_cache['Session ID'].astype(str).str.strip() == sid
+                        if mask.any():
+                            idx = int(self._data_cache[mask].index[-1])
+                            for k, v in session_row.items():
+                                self._data_cache.at[idx, k] = v
+                            found_in_cache = True
+                            self._dirty = True
+                    if not found_in_cache:
+                        self._pending_sessions.append(session_row)
+                        self._dirty = True
+            else:
+                self._pending_sessions.append(session_row)
+                self._dirty = True
+
             if flush:
                 return self.flush_pending(force=True)
         return True
 
     def flush_pending(self, force: bool = False) -> bool:
-        """Flush pending sessions to disk using atomic replace."""
+        """Flush pending sessions and/or dirty cache to disk using atomic replace."""
         with self._save_lock:
-            if not self._pending_sessions:
-                return True
+            self._ensure_cache_loaded()
+            self._normalize_schema()
             if not force and (time.time() - self._last_flush_time) < self._flush_interval_seconds:
                 return True
-            
+            if not self._pending_sessions and not self._dirty:
+                return True
+
             try:
-                self._ensure_cache_loaded()
-                pending_df = pd.DataFrame(self._pending_sessions)
-                if self._data_cache.empty:
-                    combined = pending_df
+                if self._pending_sessions:
+                    pending_df = pd.DataFrame(self._pending_sessions)
+                    if self._data_cache.empty:
+                        combined = pending_df
+                    else:
+                        combined = pd.concat([self._data_cache, pending_df], ignore_index=True)
                 else:
-                    combined = pd.concat([self._data_cache, pending_df], ignore_index=True)
-                
-                # Create backup before modifying
-                self._create_backup()
-                
-                # Ensure data directory exists
+                    combined = self._data_cache.copy()
+
+                self._maybe_backup_data_file(force=False)
+
                 self.data_file.parent.mkdir(parents=True, exist_ok=True)
-                
+
                 temp_file = self.data_file.with_suffix(self.data_file.suffix + ".tmp")
                 combined.to_excel(temp_file, index=False)
                 temp_file.replace(self.data_file)
-                
+
                 self._data_cache = combined
                 self._pending_sessions.clear()
                 self._dirty = False
@@ -1005,10 +1115,80 @@ class DataManager:
             except Exception as e:
                 logging.error(f"Error flushing session data: {e}")
                 return False
-        
+
     def save_session(self, session_data: SessionData) -> bool:
         """Save session data with error handling and backup."""
         return self.add_session(session_data, flush=False)
+
+    def load_writing_sessions(self) -> List[WritingSession]:
+        """Build WritingSession list from persisted rows (for analytics dashboard)."""
+        with self._save_lock:
+            self._ensure_cache_loaded()
+            self._normalize_schema()
+            df = self.get_all_data(include_pending=True)
+        if df.empty or 'Date and Time' not in df.columns:
+            return []
+
+        sessions: List[WritingSession] = []
+        for i, (_idx, row) in enumerate(df.iterrows()):
+            try:
+                ts = pd.to_datetime(row['Date and Time'])
+                start_time = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else datetime.fromisoformat(str(ts))
+                dur_sec = float(row.get('Duration (seconds)', 0) or 0)
+                dur_min = dur_sec / 60.0
+                end_time = start_time + timedelta(seconds=dur_sec)
+                raw_sid = row.get('Session ID', "")
+                if raw_sid is None or (isinstance(raw_sid, float) and pd.isna(raw_sid)):
+                    sid = f"legacy_{i}"
+                else:
+                    sid = str(raw_sid).strip() or f"legacy_{i}"
+                wc = int(row.get('Word Count', 0) or 0)
+                wpm = float(row.get('WPM', 0) or 0)
+                prod = float(row.get('Productivity Score', 0) or 0)
+                sessions.append(WritingSession(
+                    session_id=sid,
+                    start_time=start_time,
+                    end_time=end_time,
+                    word_count=wc,
+                    duration_minutes=dur_min,
+                    wpm=wpm,
+                    productivity_score=prod,
+                    focus_score=prod,
+                ))
+            except Exception as ex:
+                logging.warning(f"Skipping bad history row: {ex}")
+        return sessions
+
+    def backup_data_file_now(self) -> None:
+        """Force an immediate on-disk backup (Tools menu)."""
+        self._maybe_backup_data_file(force=True)
+
+    def _maybe_backup_data_file(self, force: bool = False) -> None:
+        """Back up at most once per app startup and once per calendar day unless forced."""
+        if not self.data_file.exists():
+            return
+        today = date.today()
+        if force:
+            self._run_data_backup()
+            self._last_data_backup_date = today
+            return
+        if not self._flush_backup_startup_done:
+            self._flush_backup_startup_done = True
+            self._run_data_backup()
+            self._last_data_backup_date = today
+            return
+        if self._last_data_backup_date != today:
+            self._last_data_backup_date = today
+            self._run_data_backup()
+
+    def _run_data_backup(self) -> None:
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = self.backup_dir / f"data_backup_{timestamp}.xlsx"
+            shutil.copy2(self.data_file, backup_file)
+            self._cleanup_old_backups()
+        except Exception as e:
+            logging.warning(f"Failed to create data backup: {e}")
     
     def load_today_data(self) -> int:
         """Load today's word count from saved data."""
@@ -1087,22 +1267,6 @@ class DataManager:
         except Exception as e:
             logging.error(f"Error exporting data: {e}")
             return None
-    
-    def _create_backup(self) -> None:
-        """Create a backup of the data file."""
-        try:
-            if self.data_file.exists():
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_file = self.backup_dir / f"data_backup_{timestamp}.xlsx"
-                
-                import shutil
-                shutil.copy2(self.data_file, backup_file)
-                
-                # Clean up old backups (keep last 10)
-                self._cleanup_old_backups()
-                
-        except Exception as e:
-            logging.warning(f"Failed to create data backup: {e}")
     
     def _cleanup_old_backups(self) -> None:
         """Remove old backup files, keeping only the most recent ones."""
@@ -1298,110 +1462,110 @@ class AnalyticsDashboard:
     def _create_weekly_activity_chart(self, parent) -> None:
         """Create a weekly activity heatmap chart."""
         try:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            
-            # Get last 7 days of data
+            fig = Figure(figsize=(10, 4))
+            ax = fig.add_subplot(111)
+
             dates = []
             word_counts = []
-            
+
             for i in range(7):
-                date = datetime.now() - timedelta(days=i)
-                daily_stats = self.analytics.get_daily_stats(date)
-                dates.append(date.strftime('%A'))
+                day = datetime.now() - timedelta(days=i)
+                daily_stats = self.analytics.get_daily_stats(day)
+                dates.append(day.strftime('%A'))
                 word_counts.append(daily_stats["words_written"])
-            
-            # Reverse to show oldest to newest
+
             dates.reverse()
             word_counts.reverse()
-            
+
             bars = ax.bar(dates, word_counts, color='skyblue', alpha=0.7)
-            
-            # Add value labels on bars
+
+            mx = max(word_counts) if word_counts else 0
             for bar, count in zip(bars, word_counts):
                 height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height + max(word_counts)*0.01,
-                       f'{count:,}', ha='center', va='bottom', fontsize=10)
-            
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height + max(mx * 0.01, 1.0),
+                    f'{count:,}', ha='center', va='bottom', fontsize=10
+                )
+
             ax.set_title('Last 7 Days Activity', fontsize=14, fontweight='bold')
             ax.set_ylabel('Words Written')
             ax.set_ylim(0, max(word_counts) * 1.1 if word_counts else 100)
-            
-            plt.tight_layout()
-            
-            # Embed in tkinter
-            canvas = FigureCanvasTkAgg(fig, parent)
+
+            fig.tight_layout()
+            canvas = FigureCanvasTkAgg(fig, master=parent)
             canvas.draw()
-            canvas.get_tk_widget().grid(row=0, column=0, sticky='nsew')
-            
+            tw = canvas.get_tk_widget()
+            tw.grid(row=0, column=0, sticky='nsew')
+            parent.bind('<Destroy>', lambda _e: plt.close(fig), add='+')
+
         except Exception as e:
             ttk.Label(parent, text=f"Chart error: {e}").pack()
-            
+
     def _create_wpm_trend_chart(self, parent) -> None:
         """Create WPM trend chart."""
         try:
-            fig, ax = plt.subplots(figsize=(8, 6))
-            
-            # Get recent sessions for WPM trend
+            fig = Figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+
             recent_sessions = self.analytics.sessions[-20:] if len(self.analytics.sessions) >= 20 else self.analytics.sessions
-            
+
             if recent_sessions:
                 dates = [s.start_time.strftime('%m/%d') for s in recent_sessions]
                 wpm_values = [s.wpm for s in recent_sessions]
-                
+
                 ax.plot(dates, wpm_values, marker='o', linewidth=2, markersize=6, color='green')
                 ax.set_title('WPM Trend', fontsize=12, fontweight='bold')
                 ax.set_ylabel('Words Per Minute')
                 ax.set_xlabel('Date')
-                
-                # Rotate x-axis labels for better readability
-                plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-                
+                for label in ax.get_xticklabels():
+                    label.set_rotation(45)
+                    label.set_ha('right')
             else:
                 ax.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax.transAxes)
                 ax.set_title('WPM Trend', fontsize=12, fontweight='bold')
-            
-            plt.tight_layout()
-            
-            canvas = FigureCanvasTkAgg(fig, parent)
+
+            fig.tight_layout()
+            canvas = FigureCanvasTkAgg(fig, master=parent)
             canvas.draw()
             canvas.get_tk_widget().grid(row=0, column=0, sticky='nsew')
-            
+            parent.bind('<Destroy>', lambda _e: plt.close(fig), add='+')
+
         except Exception as e:
             ttk.Label(parent, text=f"Chart error: {e}").grid(row=0, column=0)
-            
+
     def _create_word_count_chart(self, parent) -> None:
         """Create daily word count chart."""
         try:
-            fig, ax = plt.subplots(figsize=(8, 6))
-            
-            # Get last 14 days of word counts
+            fig = Figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+
             dates = []
             word_counts = []
-            
+
             for i in range(14):
-                date = datetime.now() - timedelta(days=i)
-                daily_stats = self.analytics.get_daily_stats(date)
-                dates.append(date.strftime('%m/%d'))
+                day = datetime.now() - timedelta(days=i)
+                daily_stats = self.analytics.get_daily_stats(day)
+                dates.append(day.strftime('%m/%d'))
                 word_counts.append(daily_stats["words_written"])
-            
-            # Reverse to show oldest to newest
+
             dates.reverse()
             word_counts.reverse()
-            
-            bars = ax.bar(dates, word_counts, color='lightcoral', alpha=0.7)
+
+            ax.bar(dates, word_counts, color='lightcoral', alpha=0.7)
             ax.set_title('Daily Word Count', fontsize=12, fontweight='bold')
             ax.set_ylabel('Words Written')
             ax.set_xlabel('Date')
-            
-            # Rotate x-axis labels
-            plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-            
-            plt.tight_layout()
-            
-            canvas = FigureCanvasTkAgg(fig, parent)
+            for label in ax.get_xticklabels():
+                label.set_rotation(45)
+                label.set_ha('right')
+
+            fig.tight_layout()
+            canvas = FigureCanvasTkAgg(fig, master=parent)
             canvas.draw()
             canvas.get_tk_widget().grid(row=0, column=0, sticky='nsew')
-            
+            parent.bind('<Destroy>', lambda _e: plt.close(fig), add='+')
+
         except Exception as e:
             ttk.Label(parent, text=f"Chart error: {e}").grid(row=0, column=0)
             
@@ -1505,21 +1669,24 @@ class SocialFeatures:
 class WordCountApp:
     def __init__(self, root: tk.Tk):
         """Initialize the WordCountApp with improved UI and functionality."""
-        self.setup_logging()
         self.root = root
-        self.config = Config()
+        self._app_data_dir = user_data_dir()
+        migrate_legacy_data_to_app_dir(self._app_data_dir)
+        self.setup_logging()
+        self.config = Config(self._app_data_dir / "config.json")
         self.data_manager = DataManager(
-            flush_interval_seconds=self.config.get("data_flush_interval", 60)
+            self._app_data_dir / "WordCountData.xlsx",
+            flush_interval_seconds=self.config.get("data_flush_interval", 60),
         )
         self.word_detector = WordDetector(self.config.get("min_word_length", 2))
         self.statistics = Statistics(self.config.get("wpm_history_size", 10))
         self.app_state = AppState()
         self.keyboard_shortcuts = KeyboardShortcuts(self)
         self.security_manager = SecurityManager()
-        self.goal_manager = GoalManager()
-        self.analytics = None
-        self.social_features = SocialFeatures() # Initialize social features
-        
+        self.analytics = AdvancedAnalytics()
+        self.goal_manager = GoalManager(self.analytics)
+        self.social_features = SocialFeatures()  # Initialize social features
+
         self.configure_root()
         self.initialize_variables()
         self.create_ui()
@@ -1530,12 +1697,14 @@ class WordCountApp:
 
     def setup_logging(self) -> None:
         """Configure logging for the application."""
+        self._app_data_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self._app_data_dir / "word_counter.log"
         log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         logging.basicConfig(
             level=logging.INFO,
             format=log_format,
             handlers=[
-                logging.FileHandler('word_counter.log'),
+                logging.FileHandler(log_path, encoding='utf-8'),
                 logging.StreamHandler()
             ]
         )
@@ -1566,6 +1735,8 @@ class WordCountApp:
         self.notification_cooldown = 5  # seconds between notifications
         self._pending_word_count = 0
         self._pending_word_lock = threading.Lock()
+        self._goal_notified_date: Optional[date] = None
+        self._daily_goal_save_job: Optional[Any] = None
 
     def create_ui(self) -> None:
         """Create the user interface with improved layout."""
@@ -1797,8 +1968,8 @@ class WordCountApp:
             pending = self._pending_word_count
             self._pending_word_count = 0
         
-        for _ in range(pending):
-            self.statistics.add_word()
+        if pending:
+            self.statistics.add_words(pending)
 
     def on_key_press(self, key):
         """Handle keyboard input with security checks."""
@@ -1814,16 +1985,22 @@ class WordCountApp:
                     self._pending_word_count += word_count
     
     def _show_goal_achievement_notification(self):
-        """Show notification when daily goal is achieved."""
-        current_time = time.time()
-        if (self.config.get("show_notifications", True) and 
-            current_time - self.last_notification_time > self.notification_cooldown):
-            
-            self.last_notification_time = current_time
-            messagebox.showinfo(
-                "Goal Achieved! 🎉",
-                f"Congratulations! You've reached your daily goal of {self.daily_goal} words!"
-            )
+        """Show notification when daily goal is achieved (at most once per calendar day)."""
+        today_d = datetime.now().date()
+        if self._goal_notified_date == today_d:
+            return
+        session_data = self.statistics.get_session_data()
+        total = self.today_total + session_data.word_count
+        if total < self.daily_goal:
+            return
+        if not self.config.get("show_notifications", True):
+            return
+        self._goal_notified_date = today_d
+        self.last_notification_time = time.time()
+        messagebox.showinfo(
+            "Goal Achieved! 🎉",
+            f"Congratulations! You've reached your daily goal of {self.daily_goal} words!"
+        )
 
     def start_recording(self):
         """Start the recording session."""
@@ -1871,6 +2048,20 @@ class WordCountApp:
                     self.data_manager.flush_pending(force=True)
                     self.today_total += session_data.word_count
                     self.logger.info(f"Session saved: {session_data.word_count} words")
+                    prod_score = self.statistics.get_productivity_score()
+                    hist = session_data.words_per_minute_history
+                    last_hist = float(hist[-1]) if len(hist) else float(session_data.wpm)
+                    ws = WritingSession(
+                        session_id=session_data.session_id,
+                        start_time=session_data.start_time or datetime.now(),
+                        end_time=datetime.now(),
+                        word_count=session_data.word_count,
+                        duration_minutes=session_data.duration / 60.0,
+                        wpm=session_data.wpm,
+                        productivity_score=last_hist,
+                        focus_score=float(prod_score),
+                    )
+                    self.analytics.add_session(ws)
                 else:
                     messagebox.showwarning("Warning", "Failed to save session data")
             
@@ -1905,9 +2096,10 @@ class WordCountApp:
         """Load today's word count from saved data."""
         try:
             self.today_total = self.data_manager.load_today_data()
+            self.analytics.bulk_load_sessions(self.data_manager.load_writing_sessions())
             self.update_display()
             self.logger.info(f"Loaded today's total: {self.today_total} words")
-                
+
         except Exception as e:
             self.logger.error(f"Error loading data: {e}")
 
@@ -1936,11 +2128,23 @@ class WordCountApp:
         self.root.after(interval, auto_save)
 
     def update_daily_goal(self):
-        """Update the daily goal setting."""
+        """Update the daily goal setting (debounced write to config.json)."""
         try:
             self.daily_goal = int(self.goal_var.get())
-            self.config.set("daily_goal", self.daily_goal)
-            self.update_display()
+        except ValueError:
+            return
+        self.update_display()
+        if self._daily_goal_save_job is not None:
+            try:
+                self.root.after_cancel(self._daily_goal_save_job)
+            except (tk.TclError, ValueError):
+                pass
+        self._daily_goal_save_job = self.root.after(500, self._persist_daily_goal)
+
+    def _persist_daily_goal(self) -> None:
+        self._daily_goal_save_job = None
+        try:
+            self.config.set("daily_goal", int(self.goal_var.get()))
         except ValueError:
             pass
 
@@ -1992,7 +2196,7 @@ class WordCountApp:
         """Manually backup data."""
         try:
             if self.data_manager.data_file.exists():
-                self.data_manager._create_backup()
+                self.data_manager.backup_data_file_now()
                 messagebox.showinfo("Backup Complete", "Data backup created successfully")
             else:
                 messagebox.showwarning("No Data", "No data to backup")
@@ -2273,8 +2477,6 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         dashboard_window.rowconfigure(0, weight=1)
         
         # Create dashboard
-        if self.analytics is None:
-            self.analytics = AdvancedAnalytics()
         dashboard = AnalyticsDashboard(dashboard_window, self.analytics)
         dashboard_frame = dashboard.create_dashboard()
         dashboard_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
@@ -2314,6 +2516,12 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         
         # Save window geometry
         self.config.set("window_geometry", self.root.geometry())
+        if self._daily_goal_save_job is not None:
+            try:
+                self.root.after_cancel(self._daily_goal_save_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._daily_goal_save_job = None
         self.data_manager.flush_pending(force=True)
         self.root.destroy()
 

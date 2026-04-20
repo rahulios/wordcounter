@@ -9,9 +9,9 @@ a mobile companion, payment/subscription handling, and a Flask backend.
 
 ## Current main file
 
-`wordcounter 02.06.26.py` — the active version (2,335 lines). Older dated
-copies (`wordcounter 09.06.25.py`, `wordcounter 08.03.25.py`, etc.) are kept
-around as historical snapshots; they're not part of the runtime.
+[`wordcounter.py`](wordcounter.py) — the active entry point. Older dated
+copies live under [`archive/old_versions/`](archive/old_versions/) for
+reference only.
 
 ## Requirements
 
@@ -31,31 +31,49 @@ pip install -r requirements.txt
 ## Run
 
 ```powershell
-python ".\wordcounter 02.06.26.py"
+python .\wordcounter.py
 ```
 
 The app tracks keystrokes globally, so on first run Windows may prompt for
-accessibility/input permissions. Data is written to `WordCountData.xlsx`
-and `word_count.json`; runtime logs go to `word_counter.log`.
+accessibility/input permissions.
+
+### Data directory (Windows)
+
+By default, config, Excel data, logs, and backups are stored under:
+
+`%APPDATA%\WordCounterPro\`
+
+(`config.json`, `WordCountData.xlsx`, `word_counter.log`, `backups\`, etc.)
+
+On first run, if those files exist in the **current working directory** (e.g.
+repo root) but not yet under `%APPDATA%\WordCounterPro\`, they are copied once
+so existing installs migrate cleanly.
+
+Override for development or tests:
+
+```powershell
+$env:WORDCOUNTER_DATA_DIR = "C:\path\to\folder"
+python .\wordcounter.py
+```
+
+`word_count.json` in the repo root is legacy / optional; the app primarily
+uses the paths above.
 
 ## Project layout
 
 | File / folder | Purpose |
 | --- | --- |
-| `wordcounter 02.06.26.py` | Current main app |
-| `wordcounter <date>.py` | Previous dated snapshots (reference only) |
-| `WordCountData.xlsx` | Persistent word-count dataset |
-| `word_count.json` | Lightweight state / last-session cache |
-| `word_counter.log` | Runtime log |
-| `config.json` | User-configurable settings |
-| `backups/` | Automatic data backups |
+| `wordcounter.py` | Current main app |
+| `archive/old_versions/` | Archived older `wordcounter *.py` snapshots |
+| `%APPDATA%\WordCounterPro\` | Default location for `WordCountData.xlsx`, `config.json`, logs, `backups\` |
+| `word_count.json` (repo root) | Legacy optional file; not used by default data dir |
 | `ui_improvements.py` | Theme manager and UI polish |
 | `mobile_companion.py` | Tkinter "mobile" companion view |
 | `payment_system.py` | Stripe / subscription plumbing |
 | `auth_ui.py` | Login / register / account dialogs |
 | `cloud_sync.py` | Encrypted cloud-sync client |
 | `cloud_integration.py` | Glue between app and cloud sync |
-| `wordcounter_with_cloud.py` | Variant of the app wired to cloud sync |
+| `archive/old_versions/wordcounter_with_cloud.py` | Archived cloud-sync variant (outdated import paths) |
 | `backend_server.py` | Local Flask API (dev) |
 | `backend_server_production.py` | Production Flask API (Postgres) |
 | `setup_cloud_sync.py` | One-time setup helper for cloud sync |
