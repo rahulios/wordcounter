@@ -3,10 +3,19 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.env
-.env
 
-# Build / dist
+# Env / secrets
+.env
+*.env
+config.env
+config_template.env
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Build / dist / PyInstaller
 build/
 dist/
 *.spec
@@ -15,13 +24,18 @@ dist/
 *.exe
 *.msi
 
-# Data/backups/logs
-backups/
-*.xlsx
+# Runtime logs and caches
+*.log
 word_count.json
-word_counter.log
 
-# OS/IDE
+# Backups folder (local only)
+backups/
+
+# NOTE: WordCountData.xlsx is the primary dataset and is intentionally
+# tracked. If you don't want it in git, uncomment the next line.
+# WordCountData.xlsx
+
+# OS / IDE
 .DS_Store
 Thumbs.db
 .vscode/
