@@ -867,6 +867,144 @@ FRIENDLY_APP_NAMES: Dict[str, str] = (
 )
 
 
+# ----------------------------------------------------------------------------
+# Theme palettes
+# ----------------------------------------------------------------------------
+#
+# Every color the UI consumes lives on a ThemePalette instance. _apply_theme()
+# picks the right palette at startup (and on toggle), hands it to sv-ttk for
+# the base ttk look-and-feel, then re-applies our custom ttk.Style entries so
+# labels / buttons / status bar / stats follow the palette too. Non-ttk
+# widgets (tk.Text, tk.Listbox, matplotlib figures) consume the palette
+# directly via the helpers in WordCountApp.
+
+
+@dataclass(frozen=True)
+class ThemePalette:
+    """All colors the UI consumes. One frozen instance per mode."""
+    name: str
+    is_dark: bool
+
+    # Window chrome
+    window_bg: str
+    surface_bg: str            # frames / dialogs slightly elevated over window
+    border: str                # subtle hairline between sections
+
+    # Typography
+    text_primary: str
+    text_muted: str
+    text_subtle: str
+
+    # Hero header
+    hero_fg: str
+    hero_sub_fg: str
+
+    # Stat cards
+    stat_label_fg: str
+    stat_value_fg: str
+    stat_value_muted_fg: str
+
+    # Status bar
+    status_bar_bg: str
+    status_bar_fg: str
+
+    # Primary-action button (Start Recording)
+    accent_bg: str
+    accent_fg: str
+    accent_active_bg: str
+
+    # Semantic
+    success_fg: str
+    warning_fg: str
+    link_fg: str
+
+    # Input widgets that aren't ttk-styled (tk.Text, tk.Listbox)
+    input_bg: str
+    input_fg: str
+    input_insert_fg: str       # caret color
+    input_select_bg: str
+    input_select_fg: str
+
+    # matplotlib hints (analytics dashboard)
+    chart_face: str
+    chart_axes_face: str
+    chart_text: str
+    chart_grid: str
+
+
+LIGHT_PALETTE = ThemePalette(
+    name="light",
+    is_dark=False,
+    window_bg="#FAFAFA",
+    surface_bg="#FFFFFF",
+    border="#E0E0E0",
+    text_primary="#1F1F1F",
+    text_muted="#555555",
+    text_subtle="#888888",
+    hero_fg="#1F1F1F",
+    hero_sub_fg="#666666",
+    stat_label_fg="#555555",
+    stat_value_fg="#1F1F1F",
+    stat_value_muted_fg="#888888",
+    status_bar_bg="#F2F2F2",
+    status_bar_fg="#333333",
+    accent_bg="#0078D4",
+    accent_fg="#FFFFFF",
+    accent_active_bg="#106EBE",
+    success_fg="#1E8E3E",
+    warning_fg="#D97706",
+    link_fg="#0078D4",
+    input_bg="#FFFFFF",
+    input_fg="#1F1F1F",
+    input_insert_fg="#1F1F1F",
+    input_select_bg="#0078D4",
+    input_select_fg="#FFFFFF",
+    chart_face="#FFFFFF",
+    chart_axes_face="#FFFFFF",
+    chart_text="#222222",
+    chart_grid="#DDDDDD",
+)
+
+
+DARK_PALETTE = ThemePalette(
+    name="dark",
+    is_dark=True,
+    window_bg="#1C1C1C",
+    surface_bg="#262626",
+    border="#3A3A3A",
+    text_primary="#F5F5F5",
+    text_muted="#B8B8B8",
+    text_subtle="#808080",
+    hero_fg="#F5F5F5",
+    hero_sub_fg="#A8A8A8",
+    stat_label_fg="#B8B8B8",
+    stat_value_fg="#F5F5F5",
+    stat_value_muted_fg="#909090",
+    status_bar_bg="#2A2A2A",
+    status_bar_fg="#E5E5E5",
+    accent_bg="#0078D4",
+    accent_fg="#FFFFFF",
+    accent_active_bg="#2B88D8",
+    success_fg="#6DD36D",
+    warning_fg="#F2B600",
+    link_fg="#4CC2FF",
+    input_bg="#2A2A2A",
+    input_fg="#F5F5F5",
+    input_insert_fg="#F5F5F5",
+    input_select_bg="#0078D4",
+    input_select_fg="#FFFFFF",
+    chart_face="#1C1C1C",
+    chart_axes_face="#262626",
+    chart_text="#E0E0E0",
+    chart_grid="#3A3A3A",
+)
+
+
+def get_palette(mode: str) -> ThemePalette:
+    """Resolve a 'light' / 'dark' mode string to a palette instance."""
+    return DARK_PALETTE if str(mode).lower() == "dark" else LIGHT_PALETTE
+
+
 def friendly_app_name(process_name: str) -> str:
     """Return a human-readable display name for the focused app.
 
@@ -1437,8 +1575,10 @@ class Config:
         "auto_save_interval": 300,  # seconds
         "data_flush_interval": 60,  # seconds
         "daily_goal": 1000,
-        # Windows-native ttk theme; falls back to 'clam' if unavailable.
+        # Base ttk theme (fallback when sv-ttk isn't installed); see _apply_theme.
         "theme": "vista",
+        # Appearance mode: "light" or "dark". Swapped live via View > Dark Mode.
+        "theme_mode": "light",
         "window_geometry": "760x560",
         "show_notifications": True,
         "backup_enabled": True,
@@ -2067,11 +2207,34 @@ class DataManager:
 class AnalyticsDashboard:
     """Comprehensive analytics dashboard with visualizations."""
     
-    def __init__(self, parent, analytics: AdvancedAnalytics):
+    def __init__(self, parent, analytics: AdvancedAnalytics,
+                 palette: Optional["ThemePalette"] = None):
         self.parent = parent
         self.analytics = analytics
+        self.palette = palette or LIGHT_PALETTE
         self.current_view = "overview"
         self._view_frames: Dict[str, tk.Frame] = {}
+
+    def _apply_palette_to_fig(self, fig, ax) -> None:
+        """Paint a matplotlib figure+axes with the current palette.
+
+        Light mode leaves matplotlib's defaults alone (they're fine against
+        a light window). Dark mode needs the figure face, axes face, tick
+        labels, spines, and grid all re-colored or charts end up as a
+        bright white rectangle against a dark window.
+        """
+        p = self.palette
+        if not p.is_dark:
+            return
+        fig.patch.set_facecolor(p.chart_face)
+        ax.set_facecolor(p.chart_axes_face)
+        ax.tick_params(colors=p.chart_text, which="both")
+        for spine in ax.spines.values():
+            spine.set_color(p.chart_grid)
+        ax.yaxis.label.set_color(p.chart_text)
+        ax.xaxis.label.set_color(p.chart_text)
+        ax.title.set_color(p.chart_text)
+        ax.grid(True, color=p.chart_grid, alpha=0.4)
         
     def create_dashboard(self) -> tk.Frame:
         """Create the main dashboard interface."""
@@ -2276,6 +2439,7 @@ class AnalyticsDashboard:
             ax.set_ylabel('Words Written')
             ax.set_ylim(0, max(word_counts) * 1.1 if word_counts else 100)
 
+            self._apply_palette_to_fig(fig, ax)
             fig.tight_layout()
             canvas = FigureCanvasTkAgg(fig, master=parent)
             canvas.draw()
@@ -2309,6 +2473,7 @@ class AnalyticsDashboard:
                 ax.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax.transAxes)
                 ax.set_title('WPM Trend', fontsize=12, fontweight='bold')
 
+            self._apply_palette_to_fig(fig, ax)
             fig.tight_layout()
             canvas = FigureCanvasTkAgg(fig, master=parent)
             canvas.draw()
@@ -2344,6 +2509,7 @@ class AnalyticsDashboard:
                 label.set_rotation(45)
                 label.set_ha('right')
 
+            self._apply_palette_to_fig(fig, ax)
             fig.tight_layout()
             canvas = FigureCanvasTkAgg(fig, master=parent)
             canvas.draw()
@@ -2576,10 +2742,11 @@ class WordCountApp:
             ),
             wraplength=520,
             justify=tk.LEFT,
-            foreground="#555",
+            style="Muted.TLabel",
         ).pack(anchor=tk.W, pady=(4, 8))
 
         text = tk.Text(frame, height=12, wrap=tk.WORD, font=("Segoe UI", 10))
+        self.style_text_widget(text)
         text.pack(fill=tk.BOTH, expand=True)
         text.focus_set()
 
@@ -2622,26 +2789,51 @@ class WordCountApp:
         self.logger = logging.getLogger(__name__)
 
     def configure_root(self) -> None:
-        """Configure the root window properties."""
+        """Configure the root window properties and initial theme."""
         self.root.title("Word Counter Pro")
         self.root.geometry(self.config.get("window_geometry"))
         self.root.minsize(720, 520)
 
-        # ttk theme: prefer the configured one, then the native Windows theme,
-        # then a clean cross-platform fallback.
         self.style = ttk.Style()
-        available = set(self.style.theme_names())
-        preferred = [self.config.get("theme"), "aqua", "vista", "xpnative", "clam", "default"]
-        for name in preferred:
-            if name in available:
-                try:
-                    self.style.theme_use(name)
-                    break
-                except tk.TclError:
-                    continue
+        self.palette: ThemePalette = LIGHT_PALETTE  # filled in by _apply_theme
+        # Open child windows that should get re-themed on toggle. Weak-ref-ish:
+        # entries are dropped when the widget is destroyed.
+        self._themed_dialogs: List[Tuple[tk.Misc, Any]] = []
 
-        # Unified typography. Segoe UI is the Windows system font; falls back
-        # gracefully on other platforms.
+        self._apply_theme(self.config.get("theme_mode", "light"))
+
+    def _apply_theme(self, mode: str) -> None:
+        """Apply a theme mode ('light' / 'dark') to the whole app.
+
+        Uses sv-ttk when available for a modern look-and-feel across
+        Windows / macOS, then overrides our custom ttk.Style entries so
+        Hero/Stat/StatusBar/Accent/etc. pick up palette colors. Non-ttk
+        widgets that are already on-screen get re-painted via the
+        registered _themed_dialogs list.
+        """
+        palette = get_palette(mode)
+        self.palette = palette
+
+        # 1. Base ttk theme. Prefer sv-ttk if installed; it ships cohesive
+        # light/dark variants. Otherwise fall back to the native ttk theme
+        # and hand-paint critical colors for dark mode.
+        sv_ttk_applied = False
+        try:
+            import sv_ttk  # type: ignore[import-not-found]
+            sv_ttk.set_theme(palette.name, self.root)
+            sv_ttk_applied = True
+        except Exception:
+            available = set(self.style.theme_names())
+            preferred = [self.config.get("theme"), "aqua", "vista", "xpnative", "clam", "default"]
+            for name in preferred:
+                if name in available:
+                    try:
+                        self.style.theme_use(name)
+                        break
+                    except tk.TclError:
+                        continue
+
+        # 2. Typography. Segoe UI on Windows, system fallbacks elsewhere.
         base_family = "Segoe UI"
         self.root.option_add("*Font", (base_family, 10))
         self.style.configure(".", font=(base_family, 10))
@@ -2650,36 +2842,146 @@ class WordCountApp:
         self.style.configure("TLabelframe.Label", font=(base_family, 10, "bold"))
         self.style.configure("TMenubutton", font=(base_family, 10))
 
-        # Hero header styles.
-        self.style.configure("Hero.TLabel", font=(base_family, 20, "bold"))
-        self.style.configure("HeroSub.TLabel", font=(base_family, 10), foreground="#666666")
+        # 3. Custom styles — always palette-driven (override sv-ttk per-style).
+        self.style.configure("Hero.TLabel", font=(base_family, 20, "bold"),
+                             foreground=palette.hero_fg)
+        self.style.configure("HeroSub.TLabel", font=(base_family, 10),
+                             foreground=palette.hero_sub_fg)
 
-        # Stats: label vs value contrast.
-        self.style.configure("StatLabel.TLabel", font=(base_family, 10), foreground="#555555")
-        self.style.configure("StatValue.TLabel", font=(base_family, 16, "bold"))
-        self.style.configure("StatValueMuted.TLabel", font=(base_family, 14))
+        self.style.configure("StatLabel.TLabel", font=(base_family, 10),
+                             foreground=palette.stat_label_fg)
+        self.style.configure("StatValue.TLabel", font=(base_family, 16, "bold"),
+                             foreground=palette.stat_value_fg)
+        self.style.configure("StatValueMuted.TLabel", font=(base_family, 14),
+                             foreground=palette.stat_value_muted_fg)
 
-        # Legacy aliases used elsewhere in the app.
-        self.style.configure("Title.TLabel", font=(base_family, 14, "bold"))
-        self.style.configure("Stats.TLabel", font=(base_family, 11))
-        self.style.configure("Success.TLabel", foreground="#1e8e3e")
-        self.style.configure("Warning.TLabel", foreground="#d97706")
+        self.style.configure("Title.TLabel", font=(base_family, 14, "bold"),
+                             foreground=palette.text_primary)
+        self.style.configure("Stats.TLabel", font=(base_family, 11),
+                             foreground=palette.text_primary)
+        self.style.configure("Success.TLabel", foreground=palette.success_fg)
+        self.style.configure("Warning.TLabel", foreground=palette.warning_fg)
+        self.style.configure("Muted.TLabel", foreground=palette.text_muted)
 
-        # Primary action button (used for Start Recording).
-        self.style.configure(
-            "Accent.TButton",
-            font=(base_family, 10, "bold"),
-            padding=(14, 8),
-        )
+        # 4. Primary action button. sv-ttk ships an "Accent.TButton" style;
+        # if we're on sv-ttk we trust its colors and only tweak padding/font.
+        # On native ttk we hand-paint to get Fluent-ish accent.
+        if sv_ttk_applied:
+            self.style.configure("Accent.TButton",
+                                 font=(base_family, 10, "bold"),
+                                 padding=(14, 8))
+        else:
+            self.style.configure(
+                "Accent.TButton",
+                font=(base_family, 10, "bold"),
+                padding=(14, 8),
+                background=palette.accent_bg,
+                foreground=palette.accent_fg,
+            )
+            self.style.map(
+                "Accent.TButton",
+                background=[("active", palette.accent_active_bg)],
+                foreground=[("active", palette.accent_fg)],
+            )
 
-        # Status bar: flat, padded, subtle tint.
+        # 5. Status bar.
         self.style.configure(
             "StatusBar.TLabel",
             font=(base_family, 9),
-            background="#f2f2f2",
-            foreground="#333333",
+            background=palette.status_bar_bg,
+            foreground=palette.status_bar_fg,
             padding=(10, 6),
         )
+
+        # 6. In dark mode on native ttk, a few base classes need explicit
+        # dark backgrounds or they stay white-ish.
+        if palette.is_dark and not sv_ttk_applied:
+            self.style.configure(".", background=palette.window_bg,
+                                 foreground=palette.text_primary,
+                                 fieldbackground=palette.input_bg)
+            self.style.configure("TFrame", background=palette.window_bg)
+            self.style.configure("TLabel", background=palette.window_bg,
+                                 foreground=palette.text_primary)
+            self.style.configure("TLabelframe", background=palette.window_bg,
+                                 foreground=palette.text_primary)
+            self.style.configure("TLabelframe.Label", background=palette.window_bg,
+                                 foreground=palette.text_primary)
+            self.style.configure("TCheckbutton", background=palette.window_bg,
+                                 foreground=palette.text_primary)
+            self.style.configure("TRadiobutton", background=palette.window_bg,
+                                 foreground=palette.text_primary)
+
+        # 7. Root bg so margins / root area match the palette.
+        try:
+            self.root.configure(background=palette.window_bg)
+        except tk.TclError:
+            pass
+
+        # 8. Re-paint any already-registered non-ttk widgets (open dialogs,
+        # tk.Text bodies, listboxes, matplotlib figures).
+        self._repaint_themed_widgets()
+
+    # --- Theming helpers for non-ttk widgets ---------------------------
+
+    def style_text_widget(self, widget: tk.Text) -> None:
+        """Apply the current palette to a tk.Text widget."""
+        p = self.palette
+        try:
+            widget.configure(
+                background=p.input_bg,
+                foreground=p.input_fg,
+                insertbackground=p.input_insert_fg,
+                selectbackground=p.input_select_bg,
+                selectforeground=p.input_select_fg,
+            )
+        except tk.TclError:
+            pass
+
+    def style_listbox(self, widget: tk.Listbox) -> None:
+        """Apply the current palette to a tk.Listbox widget."""
+        p = self.palette
+        try:
+            widget.configure(
+                background=p.input_bg,
+                foreground=p.input_fg,
+                selectbackground=p.input_select_bg,
+                selectforeground=p.input_select_fg,
+                highlightbackground=p.border,
+            )
+        except tk.TclError:
+            pass
+
+    def register_themed_dialog(self, win: tk.Misc, repaint_fn) -> None:
+        """Register a dialog window + a callable(palette) that re-paints it.
+
+        Called by dialogs that want to react to live dark-mode toggles.
+        Entries are garbage-collected whenever their window is destroyed.
+        """
+        self._themed_dialogs.append((win, repaint_fn))
+
+    def _repaint_themed_widgets(self) -> None:
+        """Re-paint every registered dialog, dropping dead entries."""
+        alive: List[Tuple[tk.Misc, Any]] = []
+        for win, fn in self._themed_dialogs:
+            try:
+                if not win.winfo_exists():
+                    continue
+                win.configure(background=self.palette.window_bg)
+                fn(self.palette)
+                alive.append((win, fn))
+            except Exception:
+                continue
+        self._themed_dialogs = alive
+
+    def toggle_dark_mode(self) -> None:
+        """View > Dark Mode menu command. Flips the palette and persists it."""
+        try:
+            new_mode = "dark" if bool(self.dark_mode_var.get()) else "light"
+        except Exception:
+            current = self.config.get("theme_mode", "light")
+            new_mode = "dark" if current == "light" else "light"
+        self.config.set("theme_mode", new_mode)
+        self._apply_theme(new_mode)
 
     def initialize_variables(self) -> None:
         """Initialize instance variables."""
@@ -2865,10 +3167,26 @@ class WordCountApp:
         # View Menu
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
+        self.dark_mode_var = tk.BooleanVar(
+            value=(self.config.get("theme_mode", "light") == "dark")
+        )
+        view_menu.add_checkbutton(
+            label="Dark Mode",
+            variable=self.dark_mode_var,
+            command=self.toggle_dark_mode,
+            accelerator="Ctrl+D",
+        )
+        view_menu.add_separator()
         view_menu.add_command(label="Analytics Dashboard", command=self.show_analytics_dashboard)
         view_menu.add_separator()
         view_menu.add_command(label="Statistics", command=self.show_statistics)
         view_menu.add_command(label="History", command=self.show_history)
+
+        self.root.bind_all(
+            "<Control-d>",
+            lambda _e: (self.dark_mode_var.set(not self.dark_mode_var.get()),
+                        self.toggle_dark_mode()),
+        )
         
         # Tools Menu
         tools_menu = tk.Menu(menubar, tearoff=0)
@@ -3414,6 +3732,7 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         list_row.pack(fill=tk.BOTH, expand=True)
 
         allowed_listbox = tk.Listbox(list_row, height=10)
+        self.style_listbox(allowed_listbox)
         allowed_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(list_row, orient=tk.VERTICAL, command=allowed_listbox.yview)
@@ -3508,6 +3827,7 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
+        win.configure(background=self.palette.window_bg)
 
         win.update_idletasks()
         x = (win.winfo_screenwidth() // 2) - (620 // 2)
@@ -3519,9 +3839,8 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
 
         ttk.Label(main, text="Privacy", font=("Helvetica", 16, "bold")).pack(anchor=tk.W, pady=(0, 10))
 
-        bg = self.root.cget("bg")
-        body = tk.Text(main, wrap=tk.WORD, height=20, relief=tk.FLAT,
-                       background=bg, borderwidth=0)
+        body = tk.Text(main, wrap=tk.WORD, height=20, relief=tk.FLAT, borderwidth=0)
+        self.style_text_widget(body)
         body.pack(fill=tk.BOTH, expand=True)
 
         statement = (
@@ -3652,7 +3971,11 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         dashboard_window.rowconfigure(0, weight=1)
         
         # Create dashboard
-        dashboard = AnalyticsDashboard(dashboard_window, self.analytics)
+        try:
+            dashboard_window.configure(background=self.palette.window_bg)
+        except tk.TclError:
+            pass
+        dashboard = AnalyticsDashboard(dashboard_window, self.analytics, palette=self.palette)
         dashboard_frame = dashboard.create_dashboard()
         dashboard_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
         
@@ -3726,6 +4049,10 @@ class OnboardingWizard:
         self.win.resizable(False, False)
         self.win.transient(root)
         self.win.grab_set()
+        try:
+            self.win.configure(background=self.app.palette.window_bg)
+        except (AttributeError, tk.TclError):
+            pass
 
         self.win.update_idletasks()
         x = (self.win.winfo_screenwidth() // 2) - (640 // 2)
@@ -3808,9 +4135,9 @@ class OnboardingWizard:
     def _render_welcome(self, parent: ttk.Frame) -> None:
         # Retitle the label we already rendered: the welcome heading above
         # read 'What this app does', so don't re-add one here. Just body text.
-        bg = self.win.cget("bg")
         body = tk.Text(parent, wrap=tk.WORD, height=18, relief=tk.FLAT,
-                       background=bg, borderwidth=0, font=("Helvetica", 10))
+                       borderwidth=0, font=("Helvetica", 10))
+        self.app.style_text_widget(body)
         body.pack(fill=tk.BOTH, expand=True)
         body.insert("1.0",
             "WordCounter tracks your writing productivity by counting words\n"
@@ -3843,8 +4170,8 @@ class OnboardingWizard:
         ).pack(anchor=tk.W, pady=(0, 12))
 
         bullets = tk.Text(parent, wrap=tk.WORD, height=8, relief=tk.FLAT,
-                          background=self.win.cget("bg"), borderwidth=0,
-                          font=("Helvetica", 10))
+                          borderwidth=0, font=("Helvetica", 10))
+        self.app.style_text_widget(bullets)
         bullets.pack(fill=tk.X, pady=(0, 12))
         bullets.insert("1.0",
             "  - Accessibility: lets WordCounter notice WHICH app is focused so\n"
@@ -3938,6 +4265,7 @@ class OnboardingWizard:
         custom_row = ttk.Frame(custom_frame)
         custom_row.pack(fill=tk.X)
         self.custom_listbox = tk.Listbox(custom_row, height=3)
+        self.app.style_listbox(self.custom_listbox)
         self.custom_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
         custom_buttons = ttk.Frame(custom_row)
         custom_buttons.pack(side=tk.LEFT, padx=(10, 0))

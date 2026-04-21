@@ -1,11 +1,27 @@
 {
     "auto_save_interval": 300,
+    "data_flush_interval": 60,
     "daily_goal": 1000,
     "theme": "clam",
+    "theme_mode": "light",
     "window_geometry": "700x500+156+156",
     "show_notifications": true,
     "backup_enabled": true,
     "max_backup_files": 5,
     "min_word_length": 2,
-    "wpm_history_size": 10
+    "wpm_history_size": 10,
+    "allowed_apps": [
+        "winword.exe",
+        "obsidian.exe",
+        "evernote.exe",
+        "scrivener.exe",
+        "notepad.exe",
+        "notepad++.exe",
+        "sublime_text.exe",
+        "typora.exe",
+        "wordpad.exe",
+        "onenote.exe"
+    ],
+    "onboarding_completed": false,
+    "launch_on_startup": false
 }

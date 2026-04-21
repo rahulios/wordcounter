@@ -6,6 +6,7 @@ numpy>=1.24.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 psutil>=5.9.0
+sv-ttk>=2.5.5            # modern cohesive light/dark ttk theme (Win + macOS)
 
 # Windows-only: focus hook via SetWinEventHook + HKCU\...\Run startup toggle.
 pywin32>=306; sys_platform == "win32"

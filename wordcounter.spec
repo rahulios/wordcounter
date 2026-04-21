@@ -19,7 +19,7 @@
 #   * Data files are intentionally minimal: the app creates its own
 #     %APPDATA%\WordCounterPro\ directory at runtime for config / data / logs.
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 
 block_cipher = None
@@ -38,14 +38,21 @@ hiddenimports += [
     "winreg",
     "seaborn",
     "openpyxl",
+    "sv_ttk",
 ]
+
+
+# sv-ttk ships its tcl theme files as package data; PyInstaller needs
+# them bundled or sv_ttk.set_theme() will raise at runtime.
+datas = []
+datas += collect_data_files("sv_ttk")
 
 
 a = Analysis(
     ["wordcounter.py"],
     pathex=["."],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
