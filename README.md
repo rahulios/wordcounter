@@ -181,8 +181,7 @@ WORDCOUNTER_DATA_DIR=/tmp/wc python wordcounter.py
 | [`INSTALL.md`](INSTALL.md) | End-user install guide (Windows + macOS) |
 | [`BUILD_MAC.md`](BUILD_MAC.md) | Copy-paste build instructions for the macOS `.app` |
 | [`FEEDBACK_FORM.md`](FEEDBACK_FORM.md) | Pilot feedback form spec |
-| [`archive/old_versions/`](archive/old_versions/) | Older dated `wordcounter *.py` snapshots |
-| [`archive/product-infra-2025/`](archive/product-infra-2025/) | Parked v0 cloud / auth / backend / payments / mobile code |
+| [`demo_data.py`](demo_data.py) | Generates synthetic writing history into a temp dir so you can preview the analytics dashboard without using real data |
 
 ## Building
 

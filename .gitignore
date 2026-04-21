@@ -32,9 +32,14 @@ word_count.json
 # Backups folder (local only)
 backups/
 
-# NOTE: WordCountData.xlsx is the primary dataset and is intentionally
-# tracked. If you don't want it in git, uncomment the next line.
-# WordCountData.xlsx
+# Per-user runtime state. The app reads/writes these from the platform
+# app-data dir (~/Library/Application Support/WordCounterPro/ on macOS,
+# %APPDATA%\WordCounterPro\ on Windows). Any copy at the repo root is
+# local-only and must not be committed -- it would leak personal writing
+# history and window/session state to anyone with repo access. Defaults
+# for config.json live in Config.DEFAULT_CONFIG inside wordcounter.py.
+WordCountData.xlsx
+config.json
 
 # OS / IDE
 .DS_Store
