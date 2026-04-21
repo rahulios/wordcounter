@@ -1,22 +1,13 @@
-# Core runtime
-pynput>=1.7.6            # global keyboard listener
+# Core runtime (Windows-only writing tracker)
+pynput>=1.7.6            # global keyboard listener (gated by focus + allowlist)
 pandas>=2.0.0            # data handling + Excel I/O
 openpyxl>=3.1.0          # .xlsx engine used by pandas
 numpy>=1.24.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 psutil>=5.9.0
-pywin32>=306             # win32gui / win32process (Windows only)
+pywin32>=306             # win32gui / win32process / SetWinEventHook (Windows only)
 
-# --- Optional: cloud sync / auth / backend ---
-# Only needed if you use cloud_sync.py, auth_ui.py, backend_server*.py,
-# mobile_companion.py, or payment_system.py.
-requests>=2.31.0
-cryptography>=41.0.0
-flask>=2.3.0
-flask-cors>=4.0.0
-# psycopg2-binary>=2.9.0  # only for backend_server_production.py (Postgres)
-
-# --- Dev / packaging (optional) ---
-# pyinstaller>=6.0.0
+# --- Dev / packaging (optional, uncomment when needed) ---
+pyinstaller>=6.0.0        # build single-file .exe via wordcounter.spec
 # pytest>=7.4.0
