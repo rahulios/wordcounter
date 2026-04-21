@@ -1,10 +1,86 @@
-# WordCounter
+# Word Counter Pro
 
-A desktop app (Windows + macOS) that tracks your writing productivity
-by counting words typed in the **writing apps you care about**
-(Obsidian, Microsoft Word, Evernote, Scrivener, Ulysses, iA Writer,
-Notepad++, etc.) and logging daily progress to an Excel workbook with
-charts, goals, and analytics.
+## What it is
+
+Word Counter Pro is a private, local desktop writing-productivity tracker
+for macOS and Windows. It sits quietly in the background while you write
+in Obsidian, Microsoft Word, Scrivener, Ulysses, iA Writer, Evernote,
+Notepad++, and friends — and keeps a daily log of **how many words you
+wrote**, nothing else. No cloud. No account. No telemetry.
+
+## Who it's for
+
+- Writers who want a reliable, at-a-glance view of daily output.
+- Students and researchers grinding on long-form drafts (theses,
+  dissertations, papers) who care about streaks and cumulative progress.
+- Anyone who wants a writing-habit tracker that respects their keyboard
+  and doesn't upload anything.
+
+Heads up: this version tracks **desktop writing apps only**. If you write
+primarily in Google Docs, Notion web, or other browser-based tools, they
+aren't counted in v1.
+
+## What you get
+
+**Tracking**
+- Live word count and words-per-minute while you write.
+- Session timer that only runs inside your chosen writing apps.
+- Automatic daily totals — open the app tomorrow and today's number is
+  already waiting.
+
+**Goals & motivation**
+- A daily word-count goal with a live progress bar.
+- Writing streaks so not-writing-today has a visible cost.
+- Achievements as you hit milestones.
+
+**Analytics**
+- A dashboard with weekly and monthly charts.
+- "Best hour of day" and "most productive day of the week" insights.
+- Longest streak, average session length, WPM trends.
+
+**Data ownership**
+- Everything is stored locally in a plain Excel workbook you can open in
+  Excel, Numbers, or LibreOffice.
+- One-click CSV or JSON export.
+- Automatic rolling backups inside your user app-data folder.
+- No cloud uploads. No account. No telemetry. No network calls.
+
+**Quality-of-life**
+- Light and dark mode.
+- Keyboard shortcuts for the common actions.
+- Friendly first-run setup wizard.
+- Optional launch-on-login, so tracking starts when you do.
+
+## How privacy actually works
+
+Word Counter Pro is **not** a general keystroke logger. It works by
+watching which app is in the foreground:
+
+- A foreground-app hook notices which app you just clicked into.
+- The keyboard listener **only runs while one of your allowlisted
+  writing apps is focused**. When you switch to Chrome, Slack, your
+  password manager, or anything else, the listener is stopped; any key
+  events still in flight before it unwinds are ignored and never
+  counted, logged, or stored.
+- Only aggregate counts (words, duration, WPM) are saved to disk. The
+  partial word you're in the middle of typing lives in a short in-memory
+  buffer that's cleared on every word boundary, pause, stop, and
+  app-switch.
+- There are no cloud uploads, no telemetry, and no network calls in v1.
+
+The source is open — audit `AppFocusManager`, `FocusWatcher`, and
+`WordDetector` in [`wordcounter.py`](wordcounter.py) to verify every
+claim.
+
+## Status
+
+Current milestone: **Validate** — free, shared with a handful of friends
+for ~2 weeks of real feedback on macOS + Windows. A **Public Beta** with
+a landing page and broader allowlist is next, followed by a **Paid v1**.
+
+---
+
+# For developers
 
 Built with Tkinter + `pynput`. Windows uses `pywin32` + SetWinEventHook
 for focus tracking; macOS uses PyObjC + NSWorkspace notifications.
@@ -14,10 +90,11 @@ for focus tracking; macOS uses PyObjC + NSWorkspace notifications.
 This app is **not** a general keystroke logger. By design:
 
 - A foreground-app hook watches which app is focused.
-- The keyboard listener is **only instantiated while an allowlisted
-  writing app is focused**. When you switch to Chrome, Slack, your
-  password manager, or anything else, the listener is stopped and the
-  process receives zero keystrokes.
+- The keyboard listener **only runs while an allowlisted writing app is
+  focused**. When you switch to Chrome, Slack, your password manager, or
+  anything else, the listener is stopped; any key events still delivered
+  to the process before it unwinds are ignored and never counted, logged,
+  or stored.
 - Only aggregate word counts are persisted. The in-memory `current_word`
   buffer is short-lived and zeroed on app-switch, pause, stop, and blur.
 - No cloud uploads, no telemetry, no network calls in v1.
@@ -138,13 +215,6 @@ Before cutting a build for distribution:
 - Set `FEEDBACK_EMAIL` to a real inbox.
 - Run once locally and click through the first-run wizard to confirm
   nothing regressed.
-
-## Milestone
-
-Current milestone: **Validate** - Windows + macOS, free, shipped to
-3-5 friends for ~2 weeks of real feedback. Next milestone
-(**Public Beta**) adds a landing page, broader allowlist, and optional
-cloud sync. **Paid v1** comes after that.
 
 ## Notes
 
