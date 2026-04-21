@@ -24,8 +24,25 @@ from pathlib import Path
 import sys
 from contextlib import contextmanager
 import psutil
-import win32gui
-import win32process
+import subprocess
+
+# Platform capability flags. These drive the dispatch helpers below so the
+# rest of the code doesn't have to sprinkle sys.platform checks everywhere.
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+
+# Windows-only native deps. Guarded so the module can import (and be linted)
+# on a Mac or a Linux dev box; anything that actually needs these APIs is
+# gated behind IS_WINDOWS at call time.
+if IS_WINDOWS:
+    import win32gui  # type: ignore[import-not-found]
+    import win32process  # type: ignore[import-not-found]
+else:
+    win32gui = None  # type: ignore[assignment]
+    win32process = None  # type: ignore[assignment]
+
+# macOS-only native deps via PyObjC. Imported lazily inside the Mac
+# implementations so Windows installs don't need pyobjc at all.
 import matplotlib
 matplotlib.use('TkAgg')  # Set backend before importing pyplot
 import matplotlib.pyplot as plt
@@ -45,6 +62,8 @@ def user_data_dir() -> Path:
         appdata = os.environ.get("APPDATA")
         if appdata:
             return Path(appdata) / "WordCounterPro"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "WordCounterPro"
     return Path.home() / ".wordcounterpro"
 
 
@@ -618,6 +637,85 @@ class GoalManager:
         expected_progress = (elapsed_days / total_days) * goal.target_words
         return goal.current_progress >= expected_progress
 
+# ----------------------------------------------------------------------------
+# Platform dispatch helpers
+# ----------------------------------------------------------------------------
+#
+# Everything below is a thin cross-platform veneer so the rest of the app can
+# ask questions like "which app is focused?" or "is the app set to launch at
+# login?" without caring whether we're on Windows or macOS.
+
+
+def _foreground_info_windows() -> Tuple[str, str, Any]:
+    """Windows: return (process_name_lower, window_title_lower, hwnd_cache_key)."""
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return "", "", None
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        window_title = win32gui.GetWindowText(hwnd) or ""
+        try:
+            process_name = psutil.Process(pid).name().lower()
+        except Exception:
+            process_name = ""
+        return process_name, window_title.lower(), hwnd
+    except Exception:
+        return "", "", None
+
+
+def _foreground_info_macos() -> Tuple[str, str, Any]:
+    """macOS: return (app_name_lower, "", bundle_id_cache_key) via NSWorkspace.
+
+    We return an empty string for the window title on Mac because NSWorkspace
+    only reports the frontmost *application*, not its frontmost window title.
+    The allowlist matches on app name only, so this is fine.
+    """
+    try:
+        from AppKit import NSWorkspace  # type: ignore[import-not-found]
+    except Exception:
+        return "", "", None
+    try:
+        ws = NSWorkspace.sharedWorkspace()
+        app = ws.frontmostApplication() if ws is not None else None
+        if app is None:
+            return "", "", None
+        name = (app.localizedName() or "").lower()
+        bundle_id = app.bundleIdentifier() or ""
+        return name, "", bundle_id or name
+    except Exception:
+        return "", "", None
+
+
+def get_foreground_info() -> Tuple[str, str, Any]:
+    """Return (focus_app_name_lower, window_title_lower, cache_key).
+
+    The returned ``cache_key`` is an opaque, equality-comparable value that
+    identifies the current focused app/window. Callers can cache per-focus
+    computations against it cheaply.
+    """
+    if IS_WINDOWS:
+        return _foreground_info_windows()
+    if IS_MACOS:
+        return _foreground_info_macos()
+    return "", "", None
+
+
+def open_in_file_manager(path: Path) -> bool:
+    """Open a directory in the OS file manager. Returns True on success."""
+    try:
+        if IS_WINDOWS:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+            return True
+        if IS_MACOS:
+            subprocess.run(["open", str(path)], check=False)
+            return True
+        webbrowser.open(path.as_uri())
+        return True
+    except Exception as e:
+        logging.warning(f"open_in_file_manager failed for {path}: {e}")
+        return False
+
+
 class AppFocusManager:
     """Tracks the focused application and enforces the writing-app allowlist.
 
@@ -637,39 +735,26 @@ class AppFocusManager:
         self.current_app: Optional[str] = None
         self.current_window_title: Optional[str] = None
         self._unknown_context_warned = False
-        # Cache writing-context checks per foreground hwnd (hot path: every keystroke)
-        self._ctx_hwnd: Optional[int] = None
+        # Hot path (hit on every keystroke): cache the writing-context decision
+        # against whatever opaque key the platform backend hands us (hwnd on
+        # Windows, bundle id on macOS).
+        self._ctx_key: Any = None
         self._ctx_mono: float = 0.0
         self._ctx_is_writing: bool = False
 
-    def _window_context_from_hwnd(self, hwnd: int) -> Tuple[str, str]:
-        """Resolve process name and lowercased window title for a native window handle."""
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            window_title = win32gui.GetWindowText(hwnd)
-            process = psutil.Process(pid)
-            process_name = process.name().lower()
-            return process_name, window_title.lower()
-        except Exception:
-            return "", ""
-
     def get_active_window_info(self) -> Tuple[str, str]:
-        """Get the current active window's process name and title."""
-        try:
-            hwnd = win32gui.GetForegroundWindow()
-            return self._window_context_from_hwnd(hwnd)
-        except Exception:
-            return "", ""
+        """Return (focused app name, window title) as lowercased strings."""
+        name, title, _ = get_foreground_info()
+        return name, title
 
     def is_writing_context(self) -> bool:
         """Return True iff the focused foreground window is an allowlisted writing app."""
         try:
-            hwnd = win32gui.GetForegroundWindow()
+            process_name, _, cache_key = get_foreground_info()
             now = time.monotonic()
-            if hwnd == self._ctx_hwnd and (now - self._ctx_mono) < 1.0:
+            if cache_key is not None and cache_key == self._ctx_key and (now - self._ctx_mono) < 1.0:
                 return self._ctx_is_writing
 
-            process_name, _ = self._window_context_from_hwnd(hwnd)
             if not process_name:
                 if not self._unknown_context_warned:
                     logging.warning("Unable to determine active window context; treating as non-writing for safety.")
@@ -678,7 +763,7 @@ class AppFocusManager:
             else:
                 is_writing = process_name in self.allowed_apps
 
-            self._ctx_hwnd = hwnd
+            self._ctx_key = cache_key
             self._ctx_mono = now
             self._ctx_is_writing = is_writing
             return is_writing
@@ -700,7 +785,7 @@ class AppFocusManager:
             logging.warning(f"Failed to persist allowed_apps: {e}")
 
     def _invalidate_cache(self) -> None:
-        self._ctx_hwnd = None
+        self._ctx_key = None
         self._ctx_mono = 0.0
         self._ctx_is_writing = False
 
@@ -732,9 +817,11 @@ RUN_REGISTRY_VALUE_NAME = "WordCounterPro"
 
 
 # Human-readable display names for the apps the user is likely to see.
-# The allowlist is always stored as lowercase process names (*.exe); this map
-# only affects what gets rendered in the UI / status bar.
-FRIENDLY_APP_NAMES: Dict[str, str] = {
+# On Windows the allowlist is stored as lowercase *.exe process names; on macOS
+# it's stored as the lowercased NSRunningApplication.localizedName. Either way,
+# this map (and the fallback in friendly_app_name) only affects what gets
+# rendered in the UI.
+_FRIENDLY_APP_NAMES_WINDOWS: Dict[str, str] = {
     "winword.exe": "Microsoft Word",
     "obsidian.exe": "Obsidian",
     "evernote.exe": "Evernote",
@@ -753,12 +840,39 @@ FRIENDLY_APP_NAMES: Dict[str, str] = {
     "cursor.exe": "Cursor",
 }
 
+# On macOS, localizedName is already the human-readable label ("Obsidian",
+# "Microsoft Word"). This map is just a title-case fix-up for the ones whose
+# lowercased localizedName loses information (e.g. "ia writer" -> "iA Writer").
+_FRIENDLY_APP_NAMES_MACOS: Dict[str, str] = {
+    "microsoft word": "Microsoft Word",
+    "obsidian": "Obsidian",
+    "evernote": "Evernote",
+    "scrivener": "Scrivener",
+    "ulysses": "Ulysses",
+    "ia writer": "iA Writer",
+    "notes": "Notes",
+    "textedit": "TextEdit",
+    "bbedit": "BBEdit",
+    "sublime text": "Sublime Text",
+    "typora": "Typora",
+    "notion": "Notion",
+    "bear": "Bear",
+    "logseq": "Logseq",
+    "visual studio code": "Visual Studio Code",
+    "cursor": "Cursor",
+}
+
+FRIENDLY_APP_NAMES: Dict[str, str] = (
+    _FRIENDLY_APP_NAMES_MACOS if IS_MACOS else _FRIENDLY_APP_NAMES_WINDOWS
+)
+
 
 def friendly_app_name(process_name: str) -> str:
-    """Return a human-readable display name for a Windows process name.
+    """Return a human-readable display name for the focused app.
 
-    Known apps come from FRIENDLY_APP_NAMES. Unknown apps fall back to a
-    stripped, title-cased form (e.g. ``my_app.exe`` -> ``My App``).
+    On Windows the input is a lowercased ``*.exe`` name; on macOS it's the
+    lowercased ``localizedName``. Known apps come from ``FRIENDLY_APP_NAMES``;
+    unknown apps fall back to a cleaned-up title-cased form.
     """
     if not process_name:
         return ""
@@ -780,10 +894,10 @@ def _build_startup_command() -> str:
     return f'"{interpreter}" "{script}"'
 
 
-def set_launch_on_startup(enable: bool) -> bool:
-    """Add or remove the HKCU Run registry entry for auto-launch. Returns success."""
+def _set_launch_on_startup_windows(enable: bool) -> bool:
+    """Windows: add/remove the HKCU Run registry entry for auto-launch."""
     try:
-        import winreg
+        import winreg  # type: ignore[import-not-found]
     except ImportError:
         return False
     try:
@@ -801,10 +915,10 @@ def set_launch_on_startup(enable: bool) -> bool:
         return False
 
 
-def is_launch_on_startup() -> bool:
-    """Return True if the Run registry entry is currently present."""
+def _is_launch_on_startup_windows() -> bool:
+    """Windows: return True iff the HKCU Run registry entry is present."""
     try:
-        import winreg
+        import winreg  # type: ignore[import-not-found]
     except ImportError:
         return False
     try:
@@ -818,7 +932,25 @@ def is_launch_on_startup() -> bool:
         return False
 
 
-class FocusWatcher:
+def set_launch_on_startup(enable: bool) -> bool:
+    """Platform-dispatched toggle for 'launch this app on login'."""
+    if IS_WINDOWS:
+        return _set_launch_on_startup_windows(enable)
+    if IS_MACOS:
+        return _set_launch_on_startup_macos(enable)
+    return False
+
+
+def is_launch_on_startup() -> bool:
+    """Platform-dispatched query for the current auto-launch state."""
+    if IS_WINDOWS:
+        return _is_launch_on_startup_windows()
+    if IS_MACOS:
+        return _is_launch_on_startup_macos()
+    return False
+
+
+class _WindowsFocusWatcher:
     """Watches foreground-window changes via Win32 SetWinEventHook.
 
     Runs a private Windows message loop in a daemon thread. On each
@@ -944,6 +1076,266 @@ class FocusWatcher:
             self._proc = None
 
 
+class _NullFocusWatcher:
+    """Fallback watcher for unsupported platforms: does nothing, safely."""
+
+    def __init__(self, root: tk.Tk, on_focus_change):
+        self._root = root
+        self._on_focus_change = on_focus_change
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+class _MacFocusWatcher:
+    """Watches focused-app changes on macOS via NSWorkspace notifications.
+
+    Subscribes to ``NSWorkspaceDidActivateApplicationNotification`` on the
+    shared NSWorkspace notification center. Each notification fires the
+    callback ``on_focus_change(localizedName_lowercased)`` back on the Tk
+    main thread via ``root.after``.
+
+    No polling loop: the observer is driven by Cocoa's run loop, and NSWorkspace
+    guarantees notifications on app activation (including the initial startup
+    activation of the app the user was in when we launched).
+    """
+
+    def __init__(self, root: tk.Tk, on_focus_change):
+        self._root = root
+        self._on_focus_change = on_focus_change
+        self._observer = None
+        self._center = None
+
+    def start(self) -> None:
+        if self._observer is not None:
+            return
+        try:
+            import objc  # type: ignore[import-not-found]
+            from AppKit import NSWorkspace  # type: ignore[import-not-found]
+            from Foundation import NSObject  # type: ignore[import-not-found]
+        except Exception as e:
+            logging.error(f"FocusWatcher (mac): PyObjC not available: {e}")
+            return
+
+        outer = self
+
+        class _Observer(NSObject):  # type: ignore[misc]
+            def appActivated_(self, notification):
+                try:
+                    info = notification.userInfo() if notification is not None else None
+                    app = info.get("NSWorkspaceApplicationKey") if info is not None else None
+                    name = ""
+                    if app is not None:
+                        try:
+                            name = (app.localizedName() or "").lower()
+                        except Exception:
+                            name = ""
+                    outer._schedule(name)
+                except Exception:
+                    pass
+
+        try:
+            ws = NSWorkspace.sharedWorkspace()
+            self._center = ws.notificationCenter()
+            self._observer = _Observer.alloc().init()
+            self._center.addObserver_selector_name_object_(
+                self._observer,
+                objc.selector(self._observer.appActivated_, signature=b"v@:@"),
+                "NSWorkspaceDidActivateApplicationNotification",
+                None,
+            )
+            # Also immediately dispatch the current frontmost app so callers
+            # aren't blind until the user next switches apps.
+            try:
+                current = ws.frontmostApplication()
+                if current is not None:
+                    self._schedule((current.localizedName() or "").lower())
+            except Exception:
+                pass
+        except Exception as e:
+            logging.error(f"FocusWatcher (mac) start failed: {e}")
+            self._observer = None
+            self._center = None
+
+    def stop(self) -> None:
+        try:
+            if self._center is not None and self._observer is not None:
+                self._center.removeObserver_(self._observer)
+        except Exception as e:
+            logging.warning(f"FocusWatcher (mac) stop error: {e}")
+        finally:
+            self._observer = None
+            self._center = None
+
+    def _schedule(self, process_name: str) -> None:
+        try:
+            self._root.after(0, lambda p=process_name: self._on_focus_change(p))
+        except Exception:
+            pass
+
+
+class _MacLaunchAgent:
+    """Manages a per-user LaunchAgent plist for 'launch at login' on macOS.
+
+    We write the plist to ``~/Library/LaunchAgents/com.wordcounterpro.agent.plist``
+    and load it with ``launchctl``. The ProgramArguments target is the
+    executable inside the .app bundle when running a frozen build, or the
+    current python + script when running from source.
+    """
+
+    LABEL = "com.wordcounterpro.agent"
+
+    def __init__(self) -> None:
+        home = Path.home()
+        self.plist_path = home / "Library" / "LaunchAgents" / f"{self.LABEL}.plist"
+
+    def _program_arguments(self) -> List[str]:
+        if getattr(sys, "frozen", False):
+            # PyInstaller .app bundle: sys.executable points at
+            # WordCounterPro.app/Contents/MacOS/WordCounterPro
+            return [str(Path(sys.executable).resolve())]
+        script = str(Path(__file__).resolve())
+        return [sys.executable, script]
+
+    def _plist_body(self) -> str:
+        args_xml = "\n".join(
+            f"        <string>{a}</string>" for a in self._program_arguments()
+        )
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n'
+            '<dict>\n'
+            f'    <key>Label</key>\n    <string>{self.LABEL}</string>\n'
+            '    <key>ProgramArguments</key>\n    <array>\n'
+            f'{args_xml}\n    </array>\n'
+            '    <key>RunAtLoad</key>\n    <true/>\n'
+            '    <key>KeepAlive</key>\n    <false/>\n'
+            '    <key>ProcessType</key>\n    <string>Interactive</string>\n'
+            '</dict>\n'
+            '</plist>\n'
+        )
+
+    def set_enabled(self, enable: bool) -> bool:
+        try:
+            if enable:
+                self.plist_path.parent.mkdir(parents=True, exist_ok=True)
+                self.plist_path.write_text(self._plist_body(), encoding="utf-8")
+                subprocess.run(
+                    ["launchctl", "unload", str(self.plist_path)],
+                    check=False,
+                    capture_output=True,
+                )
+                result = subprocess.run(
+                    ["launchctl", "load", "-w", str(self.plist_path)],
+                    check=False,
+                    capture_output=True,
+                )
+                return result.returncode == 0
+            else:
+                if self.plist_path.exists():
+                    subprocess.run(
+                        ["launchctl", "unload", "-w", str(self.plist_path)],
+                        check=False,
+                        capture_output=True,
+                    )
+                    try:
+                        self.plist_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                return True
+        except Exception as e:
+            logging.warning(f"_MacLaunchAgent.set_enabled({enable}) failed: {e}")
+            return False
+
+    def is_enabled(self) -> bool:
+        return self.plist_path.is_file()
+
+
+class FocusWatcher:
+    """Platform-dispatching facade for the real focus watcher.
+
+    Callers construct ``FocusWatcher(root, on_focus_change)`` and call
+    ``.start()`` / ``.stop()``; the right platform backend is chosen here.
+    """
+
+    def __new__(cls, root: tk.Tk, on_focus_change):
+        if IS_WINDOWS:
+            return _WindowsFocusWatcher(root, on_focus_change)
+        if IS_MACOS:
+            return _MacFocusWatcher(root, on_focus_change)
+        return _NullFocusWatcher(root, on_focus_change)
+
+
+# ----------------------------------------------------------------------------
+# macOS backends
+# ----------------------------------------------------------------------------
+#
+# Stubs below are real on Darwin (filled in by later sections of this module)
+# and no-ops on other platforms. We keep the function names stable so the
+# dispatch helpers above never have to guard imports.
+
+def _set_launch_on_startup_macos(enable: bool) -> bool:
+    """macOS: add/remove the per-user LaunchAgent plist. See _MacLaunchAgent."""
+    return _MacLaunchAgent().set_enabled(enable) if IS_MACOS else False
+
+
+def _is_launch_on_startup_macos() -> bool:
+    """macOS: True iff our LaunchAgent plist is installed."""
+    return _MacLaunchAgent().is_enabled() if IS_MACOS else False
+
+
+# macOS permission helpers. These are silent probes used by the onboarding
+# wizard and the 'Check Permissions' menu command. None == unknown (e.g.
+# PyObjC missing). They do NOT trigger macOS's one-time permission prompt.
+
+def mac_accessibility_granted() -> Optional[bool]:
+    """True/False for current Accessibility grant; None if we couldn't check."""
+    if not IS_MACOS:
+        return None
+    try:
+        from ApplicationServices import AXIsProcessTrusted  # type: ignore[import-not-found]
+        return bool(AXIsProcessTrusted())
+    except Exception:
+        return None
+
+
+def mac_input_monitoring_granted() -> Optional[bool]:
+    """True/False for current Input Monitoring grant; None if we couldn't check."""
+    if not IS_MACOS:
+        return None
+    try:
+        from Quartz import CGPreflightListenEventAccess  # type: ignore[import-not-found]
+        return bool(CGPreflightListenEventAccess())
+    except Exception:
+        return None
+
+
+def open_mac_privacy_pane(pane: str) -> bool:
+    """Open a specific pane of System Settings > Privacy & Security.
+
+    ``pane`` is one of ``accessibility`` or ``input_monitoring``. Returns
+    True if the URL scheme was dispatched, False otherwise.
+    """
+    urls = {
+        "accessibility": "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        "input_monitoring": "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+    }
+    url = urls.get(pane)
+    if not url:
+        return False
+    try:
+        subprocess.run(["open", url], check=False)
+        return True
+    except Exception as e:
+        logging.warning(f"open_mac_privacy_pane({pane}) failed: {e}")
+        return False
+
+
 @dataclass
 class SessionData:
     """Data class for session information."""
@@ -1006,7 +1398,11 @@ Keyboard Shortcuts:
 
 class Config:
     """Configuration management for the application."""
-    DEFAULT_ALLOWED_APPS = [
+
+    # Default writing-app allowlist, keyed per platform.
+    # Windows matches on lowercase process exe names; macOS matches on
+    # lowercase NSRunningApplication.localizedName.
+    _DEFAULT_ALLOWED_APPS_WINDOWS = [
         "winword.exe",       # Microsoft Word
         "obsidian.exe",      # Obsidian
         "evernote.exe",      # Evernote
@@ -1018,6 +1414,24 @@ class Config:
         "wordpad.exe",       # WordPad
         "onenote.exe",       # OneNote (desktop)
     ]
+    _DEFAULT_ALLOWED_APPS_MACOS = [
+        "microsoft word",
+        "obsidian",
+        "evernote",
+        "scrivener",
+        "ulysses",
+        "ia writer",
+        "notes",
+        "textedit",
+        "bbedit",
+        "sublime text",
+        "typora",
+        "bear",
+        "logseq",
+    ]
+    DEFAULT_ALLOWED_APPS = (
+        _DEFAULT_ALLOWED_APPS_MACOS if IS_MACOS else _DEFAULT_ALLOWED_APPS_WINDOWS
+    )
 
     DEFAULT_CONFIG = {
         "auto_save_interval": 300,  # seconds
@@ -2127,15 +2541,9 @@ class WordCountApp:
             self.logger.warning(f"Crash prompt failed: {e}")
 
     def open_crash_logs_folder(self) -> None:
-        """Open the crashes directory in Windows Explorer."""
+        """Open the crashes directory in the OS file manager."""
         d = crashes_dir()
-        try:
-            if sys.platform == "win32":
-                os.startfile(str(d))  # type: ignore[attr-defined]
-            else:
-                webbrowser.open(d.as_uri())
-        except Exception as e:
-            self.logger.warning(f"Failed to open crashes folder: {e}")
+        if not open_in_file_manager(d):
             messagebox.showinfo(
                 "Crash logs",
                 f"Crash logs are stored at:\n{d}",
@@ -2223,7 +2631,7 @@ class WordCountApp:
         # then a clean cross-platform fallback.
         self.style = ttk.Style()
         available = set(self.style.theme_names())
-        preferred = [self.config.get("theme"), "vista", "xpnative", "clam", "default"]
+        preferred = [self.config.get("theme"), "aqua", "vista", "xpnative", "clam", "default"]
         for name in preferred:
             if name in available:
                 try:
@@ -2467,6 +2875,10 @@ class WordCountApp:
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Writing Apps...", command=self.show_writing_apps_settings)
         tools_menu.add_command(label="About Privacy...", command=self.show_privacy_dialog)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Setup Wizard...", command=self._show_onboarding)
+        if IS_MACOS:
+            tools_menu.add_command(label="Check macOS Permissions...", command=self.show_mac_permissions_dialog)
         tools_menu.add_separator()
         tools_menu.add_command(label="Keyboard Shortcuts", command=self.keyboard_shortcuts.show_shortcuts_help)
         tools_menu.add_separator()
@@ -3142,6 +3554,92 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         bottom.pack(fill=tk.X, pady=(15, 0))
         ttk.Button(bottom, text="Close", command=win.destroy).pack(side=tk.RIGHT)
 
+    def show_mac_permissions_dialog(self) -> None:
+        """macOS: compact permission re-check dialog with deep-links."""
+        if not IS_MACOS:
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("macOS Permissions")
+        win.geometry("520x320")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() // 2) - (520 // 2)
+        y = (win.winfo_screenheight() // 2) - (320 // 2)
+        win.geometry(f"520x320+{x}+{y}")
+
+        main = ttk.Frame(win, padding="20")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main, text="macOS Permissions", font=("Helvetica", 16, "bold")).pack(
+            anchor=tk.W, pady=(0, 6)
+        )
+        ttk.Label(
+            main,
+            text=(
+                "WordCounter needs both Accessibility (to see which app is "
+                "focused) and Input Monitoring (to count words) granted to "
+                "this process."
+            ),
+            wraplength=470, justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 12))
+
+        acc_var = tk.StringVar()
+        inp_var = tk.StringVar()
+
+        def label(value: Optional[bool]) -> str:
+            if value is True:
+                return "Granted"
+            if value is False:
+                return "Not granted"
+            return "Unknown"
+
+        def refresh() -> None:
+            acc_var.set(label(mac_accessibility_granted()))
+            inp_var.set(label(mac_input_monitoring_granted()))
+
+        grid = ttk.Frame(main)
+        grid.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(grid, text="Accessibility:", width=18, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(grid, textvariable=acc_var, width=14).grid(row=0, column=1, sticky=tk.W, padx=(4, 12))
+        ttk.Button(grid, text="Open Settings",
+                   command=lambda: open_mac_privacy_pane("accessibility")).grid(row=0, column=2, sticky=tk.W)
+
+        ttk.Label(grid, text="Input Monitoring:", width=18, anchor=tk.W).grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Label(grid, textvariable=inp_var, width=14).grid(row=1, column=1, sticky=tk.W, padx=(4, 12))
+        ttk.Button(grid, text="Open Settings",
+                   command=lambda: open_mac_privacy_pane("input_monitoring")).grid(row=1, column=2, sticky=tk.W)
+
+        refresh()
+
+        # Poll so statuses update as the user flips the toggles.
+        poll_job: Dict[str, Optional[str]] = {"id": None}
+
+        def poll() -> None:
+            refresh()
+            poll_job["id"] = win.after(1500, poll)
+
+        def on_close() -> None:
+            try:
+                if poll_job["id"] is not None:
+                    win.after_cancel(poll_job["id"])
+            except Exception:
+                pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        bottom = ttk.Frame(main)
+        bottom.pack(fill=tk.X, pady=(15, 0))
+        ttk.Button(bottom, text="Re-check", command=refresh).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Close", command=on_close).pack(side=tk.RIGHT)
+
+        poll_job["id"] = win.after(1500, poll)
+
     def show_analytics_dashboard(self):
         """Show the comprehensive analytics dashboard."""
         dashboard_window = tk.Toplevel(self.root)
@@ -3209,7 +3707,13 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
 
 
 class OnboardingWizard:
-    """Two-screen first-run wizard: intro/privacy, then allowlist + startup."""
+    """First-run wizard.
+
+    Two screens on Windows (welcome/privacy, then apps + login). Three screens
+    on macOS (adds a permissions step between the two) because pynput's
+    keyboard listener is a no-op on macOS until the user grants Accessibility
+    and Input Monitoring in System Settings.
+    """
 
     def __init__(self, root: tk.Tk, app: "WordCountApp"):
         self.root = root
@@ -3218,15 +3722,15 @@ class OnboardingWizard:
 
         self.win = tk.Toplevel(root)
         self.win.title("Welcome to WordCounter")
-        self.win.geometry("640x560")
+        self.win.geometry("640x580")
         self.win.resizable(False, False)
         self.win.transient(root)
         self.win.grab_set()
 
         self.win.update_idletasks()
         x = (self.win.winfo_screenwidth() // 2) - (640 // 2)
-        y = (self.win.winfo_screenheight() // 2) - (560 // 2)
-        self.win.geometry(f"640x560+{x}+{y}")
+        y = (self.win.winfo_screenheight() // 2) - (580 // 2)
+        self.win.geometry(f"640x580+{x}+{y}")
 
         self.win.protocol("WM_DELETE_WINDOW", self._on_x_close)
 
@@ -3234,36 +3738,88 @@ class OnboardingWizard:
         self.custom_apps: List[str] = []
         self.startup_var = tk.BooleanVar(value=bool(app.config.get("launch_on_startup", False)))
 
+        # Permission-status vars; only used on macOS but safe to create either way.
+        self._perm_accessibility_var = tk.StringVar(value="Unknown")
+        self._perm_input_monitoring_var = tk.StringVar(value="Unknown")
+        self._perm_poll_job: Optional[str] = None
+
         self.container = ttk.Frame(self.win, padding="24")
         self.container.pack(fill=tk.BOTH, expand=True)
 
-        self._show_screen1()
+        # Build the step list dynamically: intro -> (permissions?) -> apps/login.
+        self._screens: List[Tuple[str, Any]] = [("What this app does", self._render_welcome)]
+        if IS_MACOS:
+            self._screens.append(("Grant permissions", self._render_mac_permissions))
+        self._screens.append(("Pick writing apps", self._render_apps))
+
+        self._show_screen(0)
+
+    # --- screen plumbing --------------------------------------------------
 
     def _clear(self) -> None:
+        if self._perm_poll_job is not None:
+            try:
+                self.win.after_cancel(self._perm_poll_job)
+            except Exception:
+                pass
+            self._perm_poll_job = None
         for w in self.container.winfo_children():
             w.destroy()
 
-    def _show_screen1(self) -> None:
+    def _show_screen(self, index: int) -> None:
+        if not (0 <= index < len(self._screens)):
+            return
         self._clear()
+        title, renderer = self._screens[index]
+        total = len(self._screens)
 
-        ttk.Label(self.container, text="Welcome to WordCounter",
+        ttk.Label(self.container, text=self._screens[index][0] if index == 0 else title,
                   font=("Helvetica", 18, "bold")).pack(anchor=tk.W, pady=(0, 8))
-        ttk.Label(self.container, text="Step 1 of 2 - What this app does",
-                  foreground="#666").pack(anchor=tk.W, pady=(0, 16))
+        if index == 0:
+            heading = f"Step 1 of {total} - What this app does"
+        else:
+            heading = f"Step {index + 1} of {total} - {title}"
+        ttk.Label(self.container, text=heading, foreground="#666").pack(
+            anchor=tk.W, pady=(0, 16)
+        )
 
+        body = ttk.Frame(self.container)
+        body.pack(fill=tk.BOTH, expand=True)
+        renderer(body)
+
+        self._render_nav(index)
+
+    def _render_nav(self, index: int) -> None:
+        btns = ttk.Frame(self.container)
+        btns.pack(fill=tk.X, pady=(16, 0))
+
+        if index == 0:
+            ttk.Button(btns, text="Cancel", command=self._on_x_close).pack(side=tk.LEFT)
+        else:
+            ttk.Button(btns, text="< Back", command=lambda: self._show_screen(index - 1)).pack(side=tk.LEFT)
+
+        if index == len(self._screens) - 1:
+            ttk.Button(btns, text="Finish", command=self._finish).pack(side=tk.RIGHT)
+        else:
+            ttk.Button(btns, text="Next >", command=lambda: self._show_screen(index + 1)).pack(side=tk.RIGHT)
+
+    # --- screen renderers -------------------------------------------------
+
+    def _render_welcome(self, parent: ttk.Frame) -> None:
+        # Retitle the label we already rendered: the welcome heading above
+        # read 'What this app does', so don't re-add one here. Just body text.
         bg = self.win.cget("bg")
-        body = tk.Text(self.container, wrap=tk.WORD, height=18, relief=tk.FLAT,
-                       background=bg, borderwidth=0,
-                       font=("Helvetica", 10))
+        body = tk.Text(parent, wrap=tk.WORD, height=18, relief=tk.FLAT,
+                       background=bg, borderwidth=0, font=("Helvetica", 10))
         body.pack(fill=tk.BOTH, expand=True)
         body.insert("1.0",
             "WordCounter tracks your writing productivity by counting words\n"
             "typed in your writing apps (Obsidian, Microsoft Word, Evernote,\n"
-            "Scrivener, Notepad++, and so on).\n\n"
+            "Scrivener, and so on).\n\n"
             "How this is NOT a keylogger:\n\n"
-            "  - A foreground-window hook watches which app is focused.\n"
+            "  - A foreground-app hook watches which app is focused.\n"
             "  - The keyboard listener is only created while one of your\n"
-            "    allowlisted writing apps is focused. When you alt-tab to\n"
+            "    allowlisted writing apps is focused. When you switch to\n"
             "    anything else (Chrome, Slack, your password manager, the\n"
             "    terminal), the listener is stopped and this process\n"
             "    receives zero keystrokes.\n\n"
@@ -3271,28 +3827,91 @@ class OnboardingWizard:
             "    The typed word you are in the middle of stays in RAM only\n"
             "    until the next word boundary, then is discarded.\n\n"
             "  - No cloud uploads, no telemetry, no network calls.\n\n"
-            "On the next screen you pick which writing apps to track.\n"
-            "You can change the list any time from Tools > Writing Apps.\n"
+            "You can change your writing-app list any time from Tools >\n"
+            "Writing Apps.\n"
         )
         body.config(state=tk.DISABLED)
 
-        btns = ttk.Frame(self.container)
-        btns.pack(fill=tk.X, pady=(16, 0))
-        ttk.Button(btns, text="Cancel", command=self._on_x_close).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Next -", command=self._show_screen2).pack(side=tk.RIGHT)
+    def _render_mac_permissions(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text=(
+                "macOS protects keyboard access with two permission prompts. "
+                "WordCounter needs BOTH to count words."
+            ),
+            wraplength=580, justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 12))
 
-    def _show_screen2(self) -> None:
-        self._clear()
+        bullets = tk.Text(parent, wrap=tk.WORD, height=8, relief=tk.FLAT,
+                          background=self.win.cget("bg"), borderwidth=0,
+                          font=("Helvetica", 10))
+        bullets.pack(fill=tk.X, pady=(0, 12))
+        bullets.insert("1.0",
+            "  - Accessibility: lets WordCounter notice WHICH app is focused so\n"
+            "    it can stop listening outside your writing apps.\n\n"
+            "  - Input Monitoring: lets WordCounter observe individual key\n"
+            "    presses inside your writing apps, to count words.\n\n"
+            "Click each button below to open the right pane in System Settings,\n"
+            "then toggle WordCounter on. You may need to quit + reopen\n"
+            "WordCounter after granting Input Monitoring.\n"
+        )
+        bullets.config(state=tk.DISABLED)
 
-        ttk.Label(self.container, text="Your writing apps",
-                  font=("Helvetica", 18, "bold")).pack(anchor=tk.W, pady=(0, 8))
-        ttk.Label(self.container, text="Step 2 of 2 - Pick what to track",
-                  foreground="#666").pack(anchor=tk.W, pady=(0, 16))
-        ttk.Label(self.container,
-                  text="The keyboard listener will only run while one of these is focused.",
-                  wraplength=580, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 12))
+        grid = ttk.Frame(parent)
+        grid.pack(fill=tk.X, pady=(0, 8))
 
-        list_frame = ttk.LabelFrame(self.container, text="Default writing apps", padding="10")
+        ttk.Label(grid, text="Accessibility:", width=18, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(grid, textvariable=self._perm_accessibility_var, width=14).grid(row=0, column=1, sticky=tk.W, padx=(4, 12))
+        ttk.Button(grid, text="Open Settings",
+                   command=lambda: open_mac_privacy_pane("accessibility")).grid(row=0, column=2, sticky=tk.W)
+
+        ttk.Label(grid, text="Input Monitoring:", width=18, anchor=tk.W).grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Label(grid, textvariable=self._perm_input_monitoring_var, width=14).grid(row=1, column=1, sticky=tk.W, padx=(4, 12))
+        ttk.Button(grid, text="Open Settings",
+                   command=lambda: open_mac_privacy_pane("input_monitoring")).grid(row=1, column=2, sticky=tk.W)
+
+        ttk.Button(parent, text="Re-check now", command=self._refresh_mac_permissions).pack(
+            anchor=tk.W, pady=(8, 0)
+        )
+
+        ttk.Label(
+            parent,
+            text=(
+                "You can continue without granting these, but WordCounter "
+                "will record zero words until you do. You can re-open this "
+                "wizard later from the Tools menu."
+            ),
+            wraplength=580, justify=tk.LEFT, foreground="#666",
+        ).pack(anchor=tk.W, pady=(12, 0))
+
+        self._refresh_mac_permissions()
+        self._schedule_perm_poll()
+
+    def _refresh_mac_permissions(self) -> None:
+        def label(value: Optional[bool]) -> str:
+            if value is True:
+                return "Granted"
+            if value is False:
+                return "Not granted"
+            return "Unknown"
+        self._perm_accessibility_var.set(label(mac_accessibility_granted()))
+        self._perm_input_monitoring_var.set(label(mac_input_monitoring_granted()))
+
+    def _schedule_perm_poll(self) -> None:
+        self._perm_poll_job = self.win.after(1500, self._poll_permissions_tick)
+
+    def _poll_permissions_tick(self) -> None:
+        self._refresh_mac_permissions()
+        self._schedule_perm_poll()
+
+    def _render_apps(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="The keyboard listener will only run while one of these is focused.",
+            wraplength=580, justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 12))
+
+        list_frame = ttk.LabelFrame(parent, text="Default writing apps", padding="10")
         list_frame.pack(fill=tk.BOTH, expand=True)
 
         inner = ttk.Frame(list_frame)
@@ -3309,11 +3928,11 @@ class OnboardingWizard:
         for i, app_name in enumerate(defaults):
             var = tk.BooleanVar(value=(app_name.lower() in existing) if existing else True)
             self.allowed_vars[app_name] = var
-            parent = col_a if i < half else col_b
-            ttk.Checkbutton(parent, text=friendly_app_name(app_name),
+            parent_col = col_a if i < half else col_b
+            ttk.Checkbutton(parent_col, text=friendly_app_name(app_name),
                             variable=var).pack(anchor=tk.W, pady=2)
 
-        custom_frame = ttk.LabelFrame(self.container, text="Additional apps", padding="10")
+        custom_frame = ttk.LabelFrame(parent, text="Additional apps", padding="10")
         custom_frame.pack(fill=tk.X, pady=(12, 0))
 
         custom_row = ttk.Frame(custom_frame)
@@ -3329,23 +3948,27 @@ class OnboardingWizard:
             self.custom_apps.append(extra)
             self.custom_listbox.insert(tk.END, friendly_app_name(extra))
 
-        ttk.Checkbutton(self.container,
-                        text="Launch WordCounter when I sign in to Windows",
-                        variable=self.startup_var).pack(anchor=tk.W, pady=(16, 0))
+        startup_label = (
+            "Launch WordCounter at login" if IS_MACOS
+            else "Launch WordCounter when I sign in to Windows"
+        )
+        ttk.Checkbutton(parent, text=startup_label, variable=self.startup_var).pack(
+            anchor=tk.W, pady=(16, 0)
+        )
 
-        btns = ttk.Frame(self.container)
-        btns.pack(fill=tk.X, pady=(16, 0))
-        ttk.Button(btns, text="< Back", command=self._show_screen1).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Finish", command=self._finish).pack(side=tk.RIGHT)
+    # --- actions ---------------------------------------------------------
 
     def _add_custom(self) -> None:
-        name = simpledialog.askstring("Add writing app",
-                                      "Enter the executable name (e.g., joplin.exe):",
-                                      parent=self.win)
+        prompt = (
+            "Enter the app name (as shown in the Dock, e.g. 'Ulysses'):"
+            if IS_MACOS
+            else "Enter the executable name (e.g., joplin.exe):"
+        )
+        name = simpledialog.askstring("Add writing app", prompt, parent=self.win)
         if not name:
             return
         name = name.strip().lower()
-        if name and not name.endswith(".exe"):
+        if IS_WINDOWS and name and not name.endswith(".exe"):
             name = name + ".exe"
         if name and name not in self.custom_apps:
             self.custom_apps.append(name)
@@ -3375,14 +3998,16 @@ class OnboardingWizard:
         want_startup = bool(self.startup_var.get())
         ok = set_launch_on_startup(want_startup)
         if not ok:
-            messagebox.showwarning(
-                "Startup setting",
-                "Could not update the Windows startup entry. You can try again later from the Tools menu.",
-                parent=self.win,
+            auto_msg = (
+                "Could not update the login item. You can try again later from the Tools menu."
+                if IS_MACOS
+                else "Could not update the Windows startup entry. You can try again later from the Tools menu."
             )
+            messagebox.showwarning("Startup setting", auto_msg, parent=self.win)
         self.app.config.set("launch_on_startup", want_startup)
         self.app.config.set("onboarding_completed", True)
         self.completed = True
+        self._clear()  # also cancels the permissions poll
         self.win.destroy()
 
     def _on_x_close(self) -> None:
@@ -3393,6 +4018,7 @@ class OnboardingWizard:
         ):
             self.app.config.set("onboarding_completed", True)
             self.completed = True
+            self._clear()
             self.win.destroy()
 
 
