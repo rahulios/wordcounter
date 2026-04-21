@@ -1,25 +1,30 @@
 # Core runtime (cross-platform: Windows + macOS writing tracker)
-pynput>=1.7.6            # global keyboard listener (gated by focus + allowlist)
-pandas>=2.0.0            # data handling + Excel I/O
-openpyxl>=3.1.0          # .xlsx engine used by pandas
-numpy>=1.24.0
-matplotlib>=3.7.0
-seaborn>=0.12.0
-psutil>=5.9.0
-sv-ttk>=2.5.5            # modern cohesive light/dark ttk theme (Win + macOS)
+# Upper bounds on each dep are a soft supply-chain guard: we pin a major
+# version we've tested against so a future breaking release can't silently
+# land via `pip install -r requirements.txt`. Bump explicitly when you
+# validate a newer major.
+pynput>=1.7.6,<2             # global keyboard listener (gated by focus + allowlist)
+pandas>=2.0.0,<3             # data handling + Excel I/O
+openpyxl>=3.1.0,<4           # .xlsx engine used by pandas
+numpy>=1.24.0,<3
+matplotlib>=3.7.0,<4
+psutil>=5.9.0,<7
+sv-ttk>=2.5.5,<3             # modern cohesive light/dark ttk theme (Win + macOS)
 
 # Windows-only: focus hook via SetWinEventHook + HKCU\...\Run startup toggle.
+# pywin32 uses rolling integer build numbers rather than semver; keep the
+# lower bound loose and rely on CI + smoke tests to catch breakage.
 pywin32>=306; sys_platform == "win32"
 
 # macOS-only: NSWorkspace focus notifications, ApplicationServices for
 # Accessibility probe, Quartz for Input Monitoring probe.
 # pyobjc-core is pulled in transitively but pinning it here keeps pip's
 # resolver fast.
-pyobjc-core>=10.0; sys_platform == "darwin"
-pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
-pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
-pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-core>=10.0,<12; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0,<12; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0,<12; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0,<12; sys_platform == "darwin"
 
 # --- Dev / packaging (optional, uncomment when needed) ---
-pyinstaller>=6.0.0        # build .exe via wordcounter.spec or .app via wordcounter_mac.spec
+pyinstaller>=6.0.0,<7        # build .exe via wordcounter.spec or .app via wordcounter_mac.spec
 # pytest>=7.4.0

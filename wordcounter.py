@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from pynput import keyboard
 from pynput.keyboard import Key
+import queue
 import threading
 import pandas as pd
 from datetime import datetime, timedelta, date
@@ -22,7 +23,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import sys
-from contextlib import contextmanager
 import psutil
 import subprocess
 
@@ -50,7 +50,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
 from calendar import monthrange
-import seaborn as sns
 
 
 def user_data_dir() -> Path:
@@ -68,12 +67,29 @@ def user_data_dir() -> Path:
 
 
 def migrate_legacy_data_to_app_dir(app_dir: Path) -> None:
-    """If new app dir is empty, copy config/data from current working directory once."""
+    """If new app dir is empty, copy config/data from the repo checkout once.
+
+    Security: we only migrate when the current working directory equals the
+    directory containing this script (i.e. the repo checkout on a dev box),
+    and we leave a ``.migrated`` marker in ``app_dir`` so we never migrate
+    twice. This prevents a user who happens to launch the app from a random
+    download folder from pulling attacker-controlled ``config.json`` /
+    ``WordCountData.xlsx`` files into their real data directory.
+    """
     app_dir.mkdir(parents=True, exist_ok=True)
-    cwd = Path.cwd()
+    marker = app_dir / ".migrated"
+    if marker.exists():
+        return
+    try:
+        cwd = Path.cwd().resolve()
+        script_dir = Path(__file__).resolve().parent
+    except OSError:
+        return
+    if cwd != script_dir:
+        return
     for name in ("config.json", "WordCountData.xlsx"):
         src, dest = cwd / name, app_dir / name
-        if src.exists() and not dest.exists():
+        if src.is_file() and not dest.exists():
             try:
                 shutil.copy2(src, dest)
             except OSError:
@@ -84,12 +100,20 @@ def migrate_legacy_data_to_app_dir(app_dir: Path) -> None:
             shutil.copytree(cwd_bak, dest_bak)
         except OSError:
             pass
+    try:
+        marker.write_text("", encoding="utf-8")
+    except OSError:
+        pass
 
 
 # Application version. Bump before each friends build.
 APP_VERSION = "0.2.0-validate"
 
-# Placeholder feedback email. Replace before distributing builds.
+# TODO: set before distribution.
+# The feedback "Email us" menu item and the crash-report mailto link both
+# resolve to this address. It MUST be replaced with the real inbox before
+# you ship a build to anyone outside the project, otherwise user feedback
+# vanishes into example.com.
 FEEDBACK_EMAIL = "feedback@example.com"
 
 
@@ -101,6 +125,29 @@ def crashes_dir() -> Path:
     except OSError:
         pass
     return d
+
+
+def _redact_home(text: str) -> str:
+    """Replace the user's home directory in ``text`` with ``~``.
+
+    Tracebacks embed absolute paths to every frame's source file, which
+    leaks the OS username (``/Users/alice/...`` / ``C:\\Users\\alice\\...``).
+    Swap it out so crash reports the user copies into email stay anonymous
+    enough to forward without editing.
+    """
+    try:
+        home = str(Path.home())
+    except Exception:
+        return text
+    if not home:
+        return text
+    redacted = text.replace(home, "~")
+    # Windows tracebacks can show both slashes and backslashes for the same
+    # path; handle both spellings to catch every variant.
+    alt = home.replace("\\", "/")
+    if alt != home:
+        redacted = redacted.replace(alt, "~")
+    return redacted
 
 
 def _crash_report_text(
@@ -115,6 +162,8 @@ def _crash_report_text(
     except Exception:
         tb_text = f"{exc_type!r}: {exc_value!r}\n(traceback formatting failed)"
 
+    tb_text = _redact_home(tb_text)
+
     header = [
         "WordCounter Crash Report",
         "=" * 40,
@@ -126,6 +175,7 @@ def _crash_report_text(
         "",
         "Privacy notice: this report contains a stack trace and system info only.",
         "No keystrokes, typed words, file contents, or window titles are attached.",
+        "Home-directory paths are replaced with '~'.",
         "",
         "Traceback",
         "-" * 40,
@@ -198,7 +248,7 @@ def build_feedback_mailto(body_extra: str = "") -> str:
     ]
     if body_extra:
         lines += ["", body_extra]
-    body = "\n".join(lines)
+    body = _redact_home("\n".join(lines))
     params = {
         "subject": f"WordCounter feedback (v{APP_VERSION})",
         "body": body,
@@ -219,7 +269,10 @@ class DataError(WordCounterError):
     """Raised when there's an issue with data operations."""
     pass
 
-# Enhanced data structures for comprehensive analytics
+# ----------------------------------------------------------------------------
+# Analytics data structures and engine
+# ----------------------------------------------------------------------------
+
 @dataclass
 class WritingSession:
     """Enhanced session data with detailed analytics."""
@@ -716,6 +769,22 @@ def open_in_file_manager(path: Path) -> bool:
         return False
 
 
+def _prune_backups(backup_dir: Path, pattern: str, keep: int) -> None:
+    """Delete backup files matching ``pattern`` in ``backup_dir``, keeping the
+    ``keep`` most recent. Any failure is logged and swallowed; backups are
+    nice-to-have and must never crash the caller's save path."""
+    try:
+        backup_files = sorted(backup_dir.glob(pattern))
+        if len(backup_files) > keep:
+            for old_backup in backup_files[:-keep]:
+                try:
+                    old_backup.unlink()
+                except OSError as e:
+                    logging.warning(f"Could not remove backup {old_backup}: {e}")
+    except Exception as e:
+        logging.warning(f"Failed to prune backups in {backup_dir}: {e}")
+
+
 class AppFocusManager:
     """Tracks the focused application and enforces the writing-app allowlist.
 
@@ -816,55 +885,66 @@ RUN_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_REGISTRY_VALUE_NAME = "WordCounterPro"
 
 
-# Human-readable display names for the apps the user is likely to see.
-# On Windows the allowlist is stored as lowercase *.exe process names; on macOS
-# it's stored as the lowercased NSRunningApplication.localizedName. Either way,
-# this map (and the fallback in friendly_app_name) only affects what gets
-# rendered in the UI.
-_FRIENDLY_APP_NAMES_WINDOWS: Dict[str, str] = {
-    "winword.exe": "Microsoft Word",
-    "obsidian.exe": "Obsidian",
-    "evernote.exe": "Evernote",
-    "scrivener.exe": "Scrivener",
-    "notepad.exe": "Notepad",
-    "notepad++.exe": "Notepad++",
-    "sublime_text.exe": "Sublime Text",
-    "typora.exe": "Typora",
-    "wordpad.exe": "WordPad",
-    "onenote.exe": "OneNote",
-    "joplin.exe": "Joplin",
-    "logseq.exe": "Logseq",
-    "zettlr.exe": "Zettlr",
-    "ia writer.exe": "iA Writer",
-    "code.exe": "VS Code",
-    "cursor.exe": "Cursor",
+# Known writing apps, per platform. Single source of truth for both the
+# default allowlist and the friendly display names.
+#
+# Value is ``(friendly_name, in_default_allowlist)``. ``in_default_allowlist``
+# marks which apps land in the first-run allowlist; the rest are apps we can
+# render a nice label for if the user adds them manually, but we don't
+# opt them in by default (e.g. VS Code, Cursor, Notion -- writing-adjacent
+# but used for many non-writing tasks).
+#
+# On Windows the allowlist is keyed on lowercase *.exe process names; on
+# macOS it's keyed on the lowercased NSRunningApplication.localizedName.
+_KNOWN_APPS_WINDOWS: Dict[str, Tuple[str, bool]] = {
+    "winword.exe":      ("Microsoft Word", True),
+    "obsidian.exe":     ("Obsidian",       True),
+    "evernote.exe":     ("Evernote",       True),
+    "scrivener.exe":    ("Scrivener",      True),
+    "notepad.exe":      ("Notepad",        True),
+    "notepad++.exe":    ("Notepad++",      True),
+    "sublime_text.exe": ("Sublime Text",   True),
+    "typora.exe":       ("Typora",         True),
+    "wordpad.exe":      ("WordPad",        True),
+    "onenote.exe":      ("OneNote",        True),
+    "joplin.exe":       ("Joplin",         False),
+    "logseq.exe":       ("Logseq",         False),
+    "zettlr.exe":       ("Zettlr",         False),
+    "ia writer.exe":    ("iA Writer",      False),
+    "code.exe":         ("VS Code",        False),
+    "cursor.exe":       ("Cursor",         False),
 }
 
-# On macOS, localizedName is already the human-readable label ("Obsidian",
-# "Microsoft Word"). This map is just a title-case fix-up for the ones whose
-# lowercased localizedName loses information (e.g. "ia writer" -> "iA Writer").
-_FRIENDLY_APP_NAMES_MACOS: Dict[str, str] = {
-    "microsoft word": "Microsoft Word",
-    "obsidian": "Obsidian",
-    "evernote": "Evernote",
-    "scrivener": "Scrivener",
-    "ulysses": "Ulysses",
-    "ia writer": "iA Writer",
-    "notes": "Notes",
-    "textedit": "TextEdit",
-    "bbedit": "BBEdit",
-    "sublime text": "Sublime Text",
-    "typora": "Typora",
-    "notion": "Notion",
-    "bear": "Bear",
-    "logseq": "Logseq",
-    "visual studio code": "Visual Studio Code",
-    "cursor": "Cursor",
+_KNOWN_APPS_MACOS: Dict[str, Tuple[str, bool]] = {
+    "microsoft word":      ("Microsoft Word",      True),
+    "obsidian":            ("Obsidian",            True),
+    "evernote":            ("Evernote",            True),
+    "scrivener":           ("Scrivener",           True),
+    "ulysses":             ("Ulysses",             True),
+    "ia writer":           ("iA Writer",           True),
+    "notes":               ("Notes",               True),
+    "textedit":            ("TextEdit",            True),
+    "bbedit":              ("BBEdit",              True),
+    "sublime text":        ("Sublime Text",        True),
+    "typora":              ("Typora",              True),
+    "bear":                ("Bear",                True),
+    "logseq":              ("Logseq",              True),
+    "notion":              ("Notion",              False),
+    "visual studio code":  ("Visual Studio Code",  False),
+    "cursor":              ("Cursor",              False),
 }
 
-FRIENDLY_APP_NAMES: Dict[str, str] = (
-    _FRIENDLY_APP_NAMES_MACOS if IS_MACOS else _FRIENDLY_APP_NAMES_WINDOWS
+_KNOWN_APPS: Dict[str, Tuple[str, bool]] = (
+    _KNOWN_APPS_MACOS if IS_MACOS else _KNOWN_APPS_WINDOWS
 )
+
+FRIENDLY_APP_NAMES: Dict[str, str] = {
+    key: friendly for key, (friendly, _) in _KNOWN_APPS.items()
+}
+
+DEFAULT_ALLOWED_APPS: List[str] = [
+    key for key, (_, in_default) in _KNOWN_APPS.items() if in_default
+]
 
 
 # ----------------------------------------------------------------------------
@@ -1070,6 +1150,19 @@ def _is_launch_on_startup_windows() -> bool:
         return False
 
 
+# macOS counterparts. Resolved at call time, so the actual ``_MacLaunchAgent``
+# implementation can live below (it only needs to be defined by the time we
+# call these helpers, not by the time we define the dispatcher below).
+def _set_launch_on_startup_macos(enable: bool) -> bool:
+    """macOS: add/remove the per-user LaunchAgent plist. See _MacLaunchAgent."""
+    return _MacLaunchAgent().set_enabled(enable) if IS_MACOS else False
+
+
+def _is_launch_on_startup_macos() -> bool:
+    """macOS: True iff our LaunchAgent plist is installed."""
+    return _MacLaunchAgent().is_enabled() if IS_MACOS else False
+
+
 def set_launch_on_startup(enable: bool) -> bool:
     """Platform-dispatched toggle for 'launch this app on login'."""
     if IS_WINDOWS:
@@ -1232,20 +1325,34 @@ class _MacFocusWatcher:
     """Watches focused-app changes on macOS via NSWorkspace notifications.
 
     Subscribes to ``NSWorkspaceDidActivateApplicationNotification`` on the
-    shared NSWorkspace notification center. Each notification fires the
-    callback ``on_focus_change(localizedName_lowercased)`` back on the Tk
-    main thread via ``root.after``.
+    shared NSWorkspace notification center and delivers the activated app's
+    lowercased name to ``on_focus_change`` on the Tk main thread.
 
-    No polling loop: the observer is driven by Cocoa's run loop, and NSWorkspace
-    guarantees notifications on app activation (including the initial startup
-    activation of the app the user was in when we launched).
+    Design note: the Cocoa observer callback runs on the main thread *while
+    Tk is inside* ``Tcl_DoOneEvent``/``_nextEventMatchingEventMask``. Calling
+    any Tk API (including ``root.after``) from that callback re-enters Tcl's
+    command machinery and deadlocks on Python 3.12 (and crashes the
+    interpreter on 3.14 with a ``PyEval_RestoreThread`` fatal). So the
+    observer just enqueues the name into a thread-safe ``queue.Queue`` and
+    returns immediately; a Tk-scheduled poller drains the queue on the
+    main thread, well outside any Cocoa callback.
+
+    The poll interval directly bounds how long the pynput keyboard listener
+    stays attached after the user switches away from an allowlisted writing
+    app. Keep it short (roughly one display frame) so key events stop being
+    delivered to this process almost immediately after focus leaves.
     """
+
+    _POLL_INTERVAL_MS = 16
 
     def __init__(self, root: tk.Tk, on_focus_change):
         self._root = root
         self._on_focus_change = on_focus_change
         self._observer = None
         self._center = None
+        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._poll_job = None
+        self._stopped = False
 
     def start(self) -> None:
         if self._observer is not None:
@@ -1271,7 +1378,7 @@ class _MacFocusWatcher:
                             name = (app.localizedName() or "").lower()
                         except Exception:
                             name = ""
-                    outer._schedule(name)
+                    outer._enqueue(name)
                 except Exception:
                     pass
 
@@ -1285,20 +1392,31 @@ class _MacFocusWatcher:
                 "NSWorkspaceDidActivateApplicationNotification",
                 None,
             )
-            # Also immediately dispatch the current frontmost app so callers
+            # Also immediately enqueue the current frontmost app so callers
             # aren't blind until the user next switches apps.
             try:
                 current = ws.frontmostApplication()
                 if current is not None:
-                    self._schedule((current.localizedName() or "").lower())
+                    self._enqueue((current.localizedName() or "").lower())
             except Exception:
                 pass
         except Exception as e:
             logging.error(f"FocusWatcher (mac) start failed: {e}")
             self._observer = None
             self._center = None
+            return
+
+        self._stopped = False
+        self._poll_job = self._root.after(0, self._drain_queue)
 
     def stop(self) -> None:
+        self._stopped = True
+        if self._poll_job is not None:
+            try:
+                self._root.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
         try:
             if self._center is not None and self._observer is not None:
                 self._center.removeObserver_(self._observer)
@@ -1308,11 +1426,33 @@ class _MacFocusWatcher:
             self._observer = None
             self._center = None
 
-    def _schedule(self, process_name: str) -> None:
+    def _enqueue(self, process_name: str) -> None:
+        """Called from the Cocoa observer thread - MUST NOT touch Tk."""
         try:
-            self._root.after(0, lambda p=process_name: self._on_focus_change(p))
+            self._queue.put_nowait(process_name)
         except Exception:
             pass
+
+    def _drain_queue(self) -> None:
+        """Runs on the Tk main thread; safe to call Tk APIs here."""
+        latest: Optional[str] = None
+        try:
+            while True:
+                latest = self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        if latest is not None:
+            try:
+                self._on_focus_change(latest)
+            except Exception as e:
+                logging.warning(f"FocusWatcher (mac) dispatch error: {e}")
+        if not self._stopped:
+            try:
+                self._poll_job = self._root.after(
+                    self._POLL_INTERVAL_MS, self._drain_queue
+                )
+            except Exception:
+                self._poll_job = None
 
 
 class _MacLaunchAgent:
@@ -1410,25 +1550,11 @@ class FocusWatcher:
 
 
 # ----------------------------------------------------------------------------
-# macOS backends
+# macOS permission helpers
 # ----------------------------------------------------------------------------
 #
-# Stubs below are real on Darwin (filled in by later sections of this module)
-# and no-ops on other platforms. We keep the function names stable so the
-# dispatch helpers above never have to guard imports.
-
-def _set_launch_on_startup_macos(enable: bool) -> bool:
-    """macOS: add/remove the per-user LaunchAgent plist. See _MacLaunchAgent."""
-    return _MacLaunchAgent().set_enabled(enable) if IS_MACOS else False
-
-
-def _is_launch_on_startup_macos() -> bool:
-    """macOS: True iff our LaunchAgent plist is installed."""
-    return _MacLaunchAgent().is_enabled() if IS_MACOS else False
-
-
-# macOS permission helpers. These are silent probes used by the onboarding
-# wizard and the 'Check Permissions' menu command. None == unknown (e.g.
+# Silent probes used by the onboarding wizard and the 'Check Permissions'
+# menu command. None == unknown (e.g.
 # PyObjC missing). They do NOT trigger macOS's one-time permission prompt.
 
 def mac_accessibility_granted() -> Optional[bool]:
@@ -1450,6 +1576,54 @@ def mac_input_monitoring_granted() -> Optional[bool]:
         from Quartz import CGPreflightListenEventAccess  # type: ignore[import-not-found]
         return bool(CGPreflightListenEventAccess())
     except Exception:
+        return None
+
+
+def mac_request_input_monitoring() -> Optional[bool]:
+    """Register this process with TCC for Input Monitoring and show the prompt.
+
+    On first call, this adds the running binary to
+    System Settings > Privacy & Security > Input Monitoring (initially disabled)
+    and displays the standard macOS "would like to monitor input" dialog.
+    After the user toggles the grant on, the app must be restarted for the
+    new grant to take effect (macOS caches the TCC decision at process-start).
+
+    Returns True if already granted, False if denied/pending, None if the
+    call couldn't be made.
+    """
+    if not IS_MACOS:
+        return None
+    try:
+        from Quartz import CGRequestListenEventAccess  # type: ignore[import-not-found]
+        return bool(CGRequestListenEventAccess())
+    except Exception as e:
+        logging.warning(f"mac_request_input_monitoring failed: {e}")
+        return None
+
+
+def mac_request_accessibility() -> Optional[bool]:
+    """Register this process with TCC for Accessibility and show the prompt.
+
+    Uses ``AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})``
+    which is the sanctioned way to both check and prompt in one call. Adds
+    the binary to System Settings > Privacy & Security > Accessibility.
+
+    Returns True if already trusted, False otherwise, None on error.
+    """
+    if not IS_MACOS:
+        return None
+    try:
+        from ApplicationServices import (  # type: ignore[import-not-found]
+            AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt,
+        )
+        from CoreFoundation import CFDictionaryCreate, kCFBooleanTrue  # type: ignore[import-not-found]
+        opts = CFDictionaryCreate(
+            None, [kAXTrustedCheckOptionPrompt], [kCFBooleanTrue], 1, None, None
+        )
+        return bool(AXIsProcessTrustedWithOptions(opts))
+    except Exception as e:
+        logging.warning(f"mac_request_accessibility failed: {e}")
         return None
 
 
@@ -1534,42 +1708,16 @@ Keyboard Shortcuts:
         messagebox.showinfo("Keyboard Shortcuts", shortcuts_text.strip())
 
 
+# ----------------------------------------------------------------------------
+# Configuration, persistence, and live session state
+# ----------------------------------------------------------------------------
+
 class Config:
     """Configuration management for the application."""
 
-    # Default writing-app allowlist, keyed per platform.
-    # Windows matches on lowercase process exe names; macOS matches on
-    # lowercase NSRunningApplication.localizedName.
-    _DEFAULT_ALLOWED_APPS_WINDOWS = [
-        "winword.exe",       # Microsoft Word
-        "obsidian.exe",      # Obsidian
-        "evernote.exe",      # Evernote
-        "scrivener.exe",     # Scrivener
-        "notepad.exe",       # Windows Notepad
-        "notepad++.exe",     # Notepad++
-        "sublime_text.exe",  # Sublime Text
-        "typora.exe",        # Typora
-        "wordpad.exe",       # WordPad
-        "onenote.exe",       # OneNote (desktop)
-    ]
-    _DEFAULT_ALLOWED_APPS_MACOS = [
-        "microsoft word",
-        "obsidian",
-        "evernote",
-        "scrivener",
-        "ulysses",
-        "ia writer",
-        "notes",
-        "textedit",
-        "bbedit",
-        "sublime text",
-        "typora",
-        "bear",
-        "logseq",
-    ]
-    DEFAULT_ALLOWED_APPS = (
-        _DEFAULT_ALLOWED_APPS_MACOS if IS_MACOS else _DEFAULT_ALLOWED_APPS_WINDOWS
-    )
+    # Default writing-app allowlist is derived from _KNOWN_APPS at module
+    # scope (see that constant for the per-platform source of truth).
+    DEFAULT_ALLOWED_APPS = DEFAULT_ALLOWED_APPS
 
     DEFAULT_CONFIG = {
         "auto_save_interval": 300,  # seconds
@@ -1600,20 +1748,40 @@ class Config:
         self._validate_config()
     
     def load_config(self) -> Dict[str, Any]:
-        """Load configuration from file or create default."""
+        """Load configuration from file or create default.
+
+        Unknown keys in the loaded JSON are dropped (and logged) so they
+        don't get persisted back on the next save. This keeps `config.json`
+        tight to what the code actually reads and prevents a malformed or
+        attacker-controlled file from smuggling extra state into the app.
+        """
         try:
             if self.config_file.exists():
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     loaded_config = json.load(f)
-                    # Merge with defaults, ensuring all required keys exist
-                    config = self.DEFAULT_CONFIG.copy()
-                    config.update(loaded_config)
-                    return config
+                if not isinstance(loaded_config, dict):
+                    logging.warning(
+                        "config.json root is not an object; using defaults."
+                    )
+                    return self.DEFAULT_CONFIG.copy()
+                config = self.DEFAULT_CONFIG.copy()
+                known_keys = set(self.DEFAULT_CONFIG.keys())
+                dropped: List[str] = []
+                for key, value in loaded_config.items():
+                    if key in known_keys:
+                        config[key] = value
+                    else:
+                        dropped.append(str(key))
+                if dropped:
+                    logging.warning(
+                        f"Dropping unknown config keys: {sorted(dropped)}"
+                    )
+                return config
         except (json.JSONDecodeError, IOError) as e:
             logging.warning(f"Error loading config file: {e}. Using defaults.")
         except Exception as e:
             logging.error(f"Unexpected error loading config: {e}")
-        
+
         return self.DEFAULT_CONFIG.copy()
     
     def save_config(self) -> None:
@@ -1644,46 +1812,55 @@ class Config:
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_file = backup_dir / f"config_backup_{timestamp}.json"
-            
-            # Copy current config to backup
-            import shutil
+
             shutil.copy2(self.config_file, backup_file)
-            
-            # Clean up old backups
-            self._cleanup_old_backups(backup_dir)
-            
+
+            _prune_backups(
+                backup_dir,
+                "config_backup_*.json",
+                keep=self.config.get("max_backup_files", 5),
+            )
+
         except Exception as e:
             logging.warning(f"Failed to create config backup: {e}")
-    
-    def _cleanup_old_backups(self, backup_dir: Path) -> None:
-        """Remove old backup files, keeping only the most recent ones."""
-        try:
-            max_backups = self.config.get("max_backup_files", 5)
-            backup_files = sorted(backup_dir.glob("config_backup_*.json"))
-            
-            if len(backup_files) > max_backups:
-                for old_backup in backup_files[:-max_backups]:
-                    old_backup.unlink()
-                    
-        except Exception as e:
-            logging.warning(f"Failed to cleanup old backups: {e}")
-    
+
     def _validate_config(self) -> None:
-        """Validate configuration values."""
+        """Validate configuration values, falling back to defaults on bad input."""
         try:
-            # Validate numeric values
             if not isinstance(self.config.get("auto_save_interval"), (int, float)) or self.config["auto_save_interval"] < 30:
                 self.config["auto_save_interval"] = self.DEFAULT_CONFIG["auto_save_interval"]
                 logging.warning("Invalid auto_save_interval, using default")
-            
+
             if not isinstance(self.config.get("daily_goal"), int) or self.config["daily_goal"] < 1:
                 self.config["daily_goal"] = self.DEFAULT_CONFIG["daily_goal"]
                 logging.warning("Invalid daily_goal, using default")
-            
+
             if not isinstance(self.config.get("min_word_length"), int) or self.config["min_word_length"] < 1:
                 self.config["min_word_length"] = self.DEFAULT_CONFIG["min_word_length"]
                 logging.warning("Invalid min_word_length, using default")
-                
+
+            # allowed_apps: must be a list of non-empty strings. Drop anything
+            # that doesn't conform; if nothing survives, fall back to the
+            # curated default allowlist so the app still works.
+            raw = self.config.get("allowed_apps")
+            if isinstance(raw, list):
+                cleaned = [
+                    item.strip().lower()
+                    for item in raw
+                    if isinstance(item, str) and item.strip()
+                ]
+                if len(cleaned) != len(raw):
+                    logging.warning(
+                        "allowed_apps contained non-string or empty entries; "
+                        "they were dropped."
+                    )
+                self.config["allowed_apps"] = cleaned or list(DEFAULT_ALLOWED_APPS)
+            else:
+                logging.warning(
+                    "allowed_apps is not a list; resetting to defaults."
+                )
+                self.config["allowed_apps"] = list(DEFAULT_ALLOWED_APPS)
+
         except Exception as e:
             logging.error(f"Error validating config: {e}")
     
@@ -2110,7 +2287,7 @@ class DataManager:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_file = self.backup_dir / f"data_backup_{timestamp}.xlsx"
             shutil.copy2(self.data_file, backup_file)
-            self._cleanup_old_backups()
+            _prune_backups(self.backup_dir, "data_backup_*.xlsx", keep=10)
         except Exception as e:
             logging.warning(f"Failed to create data backup: {e}")
     
@@ -2169,40 +2346,43 @@ class DataManager:
             logging.error(f"Error getting statistics: {e}")
             return {}
     
-    def export_data(self, format: str = 'csv') -> Optional[str]:
-        """Export data in specified format."""
+    def export_data(self, format: str = 'csv', dest_path: Optional[Path] = None) -> Optional[str]:
+        """Export data in the given format to ``dest_path``.
+
+        When ``dest_path`` is None we fall back to a timestamped filename in
+        the data directory (next to ``WordCountData.xlsx``) rather than the
+        process CWD. The UI layer should prefer asking the user for a path
+        via ``filedialog.asksaveasfilename`` and passing it in.
+        """
         try:
             df = self.get_all_data(include_pending=True)
             if df.empty:
                 return None
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
-            if format.lower() == 'csv':
-                export_file = f"word_count_export_{timestamp}.csv"
-                df.to_csv(export_file, index=False)
-            elif format.lower() == 'json':
-                export_file = f"word_count_export_{timestamp}.json"
-                df.to_json(export_file, orient='records', indent=2)
-            else:
+
+            fmt = format.lower()
+            if fmt not in ('csv', 'json'):
                 return None
-                
-            return export_file
-            
+
+            if dest_path is None:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                dest_path = self.data_file.parent / f"word_count_export_{timestamp}.{fmt}"
+            dest_path = Path(dest_path)
+
+            if fmt == 'csv':
+                df.to_csv(dest_path, index=False)
+            else:
+                df.to_json(dest_path, orient='records', indent=2)
+
+            return str(dest_path)
+
         except Exception as e:
             logging.error(f"Error exporting data: {e}")
             return None
-    
-    def _cleanup_old_backups(self) -> None:
-        """Remove old backup files, keeping only the most recent ones."""
-        try:
-            backup_files = sorted(self.backup_dir.glob("data_backup_*.xlsx"))
-            if len(backup_files) > 10:
-                for old_backup in backup_files[:-10]:
-                    old_backup.unlink()
-                    
-        except Exception as e:
-            logging.warning(f"Failed to cleanup old backups: {e}")
 
+
+# ----------------------------------------------------------------------------
+# Analytics dashboard UI
+# ----------------------------------------------------------------------------
 
 class AnalyticsDashboard:
     """Comprehensive analytics dashboard with visualizations."""
@@ -2212,8 +2392,9 @@ class AnalyticsDashboard:
         self.parent = parent
         self.analytics = analytics
         self.palette = palette or LIGHT_PALETTE
-        self.current_view = "overview"
-        self._view_frames: Dict[str, tk.Frame] = {}
+        # Track mpl figures so we close them on teardown even if the
+        # container frames' <Destroy> events fire in an unexpected order.
+        self._active_figures: List[Figure] = []
 
     def _apply_palette_to_fig(self, fig, ax) -> None:
         """Paint a matplotlib figure+axes with the current palette.
@@ -2237,329 +2418,296 @@ class AnalyticsDashboard:
         ax.grid(True, color=p.chart_grid, alpha=0.4)
         
     def create_dashboard(self) -> tk.Frame:
-        """Create the main dashboard interface."""
-        dashboard_frame = ttk.Frame(self.parent)
-        
-        # Configure grid weights
-        dashboard_frame.columnconfigure(0, weight=1)
-        dashboard_frame.rowconfigure(1, weight=1)
-        
-        # Navigation tabs
-        nav_frame = ttk.Frame(dashboard_frame)
-        nav_frame.grid(row=0, column=0, sticky='ew', padx=10, pady=5)
-        
-        ttk.Button(nav_frame, text="Overview", command=lambda: self.show_view("overview")).pack(side='left', padx=5)
-        ttk.Button(nav_frame, text="Trends", command=lambda: self.show_view("trends")).pack(side='left', padx=5)
-        ttk.Button(nav_frame, text="Goals", command=lambda: self.show_view("goals")).pack(side='left', padx=5)
-        ttk.Button(nav_frame, text="Achievements", command=lambda: self.show_view("achievements")).pack(side='left', padx=5)
-        ttk.Button(nav_frame, text="Insights", command=lambda: self.show_view("insights")).pack(side='left', padx=5)
-        
-        # Content area
-        self.content_frame = ttk.Frame(dashboard_frame)
-        self.content_frame.grid(row=1, column=0, sticky='nsew', padx=10, pady=5)
-        
-        # Show default view
-        self.show_view("overview")
-        
-        return dashboard_frame
-        
-    def show_view(self, view_name: str) -> None:
-        """Switch between different dashboard views."""
-        if view_name == self.current_view and self.content_frame.winfo_children():
-            return
-        self.current_view = view_name
+        """Create the main dashboard as a single vertical scrollable view.
 
-        for frame in self._view_frames.values():
-            frame.pack_forget()
+        Prior versions of this used a 5-tab notebook (Overview / Trends /
+        Goals / Achievements / Insights). The Goals and Achievements tabs
+        were placeholders, and splitting Overview/Trends/Insights across
+        tabs hid most of the data behind clicks. Everything now lives in
+        one scrollable column with charts stacked top-to-bottom.
+        """
+        outer = ttk.Frame(self.parent)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
 
-        if view_name in self._view_frames:
-            self._view_frames[view_name].pack(fill='both', expand=True)
-            return
+        # Scrollable canvas + vertical scrollbar. We paint the canvas in
+        # the palette's window_bg so the area outside the content frame
+        # doesn't flash a default gray in dark mode.
+        canvas = tk.Canvas(outer, highlightthickness=0,
+                           background=self.palette.window_bg)
+        vscroll = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        vscroll.grid(row=0, column=1, sticky='ns')
 
-        view_frame = ttk.Frame(self.content_frame)
-        self._view_frames[view_name] = view_frame
-        view_frame.pack(fill='both', expand=True)
-        
-        # Show selected view
-        if view_name == "overview":
-            self._create_overview_view(view_frame)
-        elif view_name == "trends":
-            self._create_trends_view(view_frame)
-        elif view_name == "goals":
-            self._create_goals_view(view_frame)
-        elif view_name == "achievements":
-            self._create_achievements_view(view_frame)
-        elif view_name == "insights":
-            self._create_insights_view(view_frame)
-            
-    def _create_overview_view(self, parent) -> None:
-        """Create the overview dashboard."""
-        # Header with key metrics
-        header_frame = ttk.Frame(parent)
-        header_frame.pack(fill='x', pady=(0, 20))
-        
+        content = ttk.Frame(canvas, padding=(16, 16, 16, 16))
+        content_id = canvas.create_window((0, 0), window=content, anchor='nw')
+
+        def _sync_scrollregion(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox('all'))
+
+        def _match_width(event) -> None:
+            # Make the inner frame always fill the canvas horizontally so
+            # sections can stretch; the scrollbar handles overflow on Y.
+            canvas.itemconfigure(content_id, width=event.width)
+
+        content.bind('<Configure>', _sync_scrollregion)
+        canvas.bind('<Configure>', _match_width)
+
+        # Mouse-wheel scrolling, scoped to the canvas so we don't hijack
+        # scrolling elsewhere in the app.
+        def _on_wheel(event) -> None:
+            if sys.platform == 'darwin':
+                canvas.yview_scroll(-int(event.delta), 'units')
+            else:
+                canvas.yview_scroll(-int(event.delta / 120), 'units')
+
+        canvas.bind('<Enter>', lambda _e: canvas.bind_all('<MouseWheel>', _on_wheel))
+        canvas.bind('<Leave>', lambda _e: canvas.unbind_all('<MouseWheel>'))
+
+        self._build_content(content)
+        return outer
+
+    def _build_content(self, parent: ttk.Frame) -> None:
+        """Populate the scroll content: KPIs, insights, then charts."""
         insights = self.analytics.get_writing_insights()
-        
-        # Key metrics cards
-        metrics = [
+
+        # Row 1: headline stats.
+        self._make_stat_strip(parent, [
             ("Current Streak", f"{insights.get('current_streak', 0)} days", "🔥"),
             ("Total Words", f"{insights.get('total_words_written', 0):,}", "📝"),
             ("Avg WPM", f"{insights.get('average_wpm', 0):.1f}", "⚡"),
-            ("Consistency", f"{insights.get('consistency_score', 0)*100:.0f}%", "📊")
-        ]
-        
-        for i, (label, value, icon) in enumerate(metrics):
-            card = ttk.Frame(header_frame, relief='raised', borderwidth=1)
-            card.pack(side='left', fill='both', expand=True, padx=5)
-            
-            ttk.Label(card, text=f"{icon} {label}", font=('Arial', 10, 'bold')).pack(pady=5)
-            ttk.Label(card, text=value, font=('Arial', 16, 'bold')).pack(pady=5)
-            
-        # Recent activity chart
-        chart_frame = ttk.LabelFrame(parent, text="Recent Activity", padding=10)
-        chart_frame.pack(fill='both', expand=True, pady=10)
-        
-        self._create_weekly_activity_chart(chart_frame)
-        
-    def _create_trends_view(self, parent) -> None:
-        """Create the trends analysis view."""
-        # Time period selector
-        period_frame = ttk.Frame(parent)
-        period_frame.pack(fill='x', pady=(0, 20))
-        
-        ttk.Label(period_frame, text="Time Period:").pack(side='left')
-        period_var = tk.StringVar(value="30")
-        ttk.Radiobutton(period_frame, text="7 days", variable=period_var, value="7").pack(side='left', padx=10)
-        ttk.Radiobutton(period_frame, text="30 days", variable=period_var, value="30").pack(side='left', padx=10)
-        ttk.Radiobutton(period_frame, text="90 days", variable=period_var, value="90").pack(side='left', padx=10)
-        
-        # Charts container
-        charts_frame = ttk.Frame(parent)
-        charts_frame.pack(fill='both', expand=True)
-        
-        # Left column - WPM trend
-        left_frame = ttk.Frame(charts_frame)
-        left_frame.pack(side='left', fill='both', expand=True, padx=(0, 5))
-        
-        wpm_frame = ttk.LabelFrame(left_frame, text="WPM Trend", padding=10)
-        wpm_frame.pack(fill='both', expand=True)
-        self._create_wpm_trend_chart(wpm_frame)
-        
-        # Right column - Word count trend
-        right_frame = ttk.Frame(charts_frame)
-        right_frame.pack(side='right', fill='both', expand=True, padx=(5, 0))
-        
-        words_frame = ttk.LabelFrame(right_frame, text="Daily Word Count", padding=10)
-        words_frame.pack(fill='both', expand=True)
-        self._create_word_count_chart(words_frame)
-        
-    def _create_goals_view(self, parent) -> None:
-        """Create the goals tracking view."""
-        # Add new goal button
-        button_frame = ttk.Frame(parent)
-        button_frame.pack(fill='x', pady=(0, 20))
-        
-        ttk.Button(button_frame, text="Create New Goal", command=self._show_create_goal_dialog).pack(side='left')
-        
-        # Active goals
-        goals_frame = ttk.LabelFrame(parent, text="Active Goals", padding=10)
-        goals_frame.pack(fill='both', expand=True)
-        
-        # This would be populated with actual goals from the goal manager
-        ttk.Label(goals_frame, text="No active goals. Create your first goal to get started!", 
-                 font=('Arial', 12)).pack(pady=50)
-                 
-    def _create_achievements_view(self, parent) -> None:
-        """Create the achievements view."""
-        # Achievements grid
-        achievements_frame = ttk.Frame(parent)
-        achievements_frame.pack(fill='both', expand=True)
-        
-        # This would be populated with actual achievements
-        ttk.Label(achievements_frame, text="Achievements will appear here as you unlock them!", 
-                 font=('Arial', 12)).pack(pady=50)
-                 
-    def _create_insights_view(self, parent) -> None:
-        """Create the insights view."""
-        insights = self.analytics.get_writing_insights()
-        
-        # Insights cards
-        insights_frame = ttk.Frame(parent)
-        insights_frame.pack(fill='both', expand=True)
-        
-        insight_cards = [
+            ("Consistency", f"{insights.get('consistency_score', 0) * 100:.0f}%", "📊"),
+        ])
+
+        # Row 2: behavioral insights.
+        self._make_stat_strip(parent, [
             ("Best Writing Time", insights.get("best_writing_time", "Not enough data"), "🕐"),
             ("Most Productive Day", insights.get("most_productive_day", "Not enough data"), "📅"),
             ("Improvement Rate", f"{insights.get('improvement_rate', 0):+.1f}%", "📈"),
-            ("Average Session", f"{insights.get('average_session_length', 0):.1f} min", "⏱️")
-        ]
-        
-        for i, (label, value, icon) in enumerate(insight_cards):
-            row = i // 2
-            col = i % 2
-            
-            card = ttk.LabelFrame(insights_frame, text=f"{icon} {label}", padding=10)
-            card.grid(row=row, column=col, sticky='nsew', padx=5, pady=5)
-            
-            ttk.Label(card, text=value, font=('Arial', 14, 'bold')).pack(pady=10)
-            
-        insights_frame.grid_columnconfigure(0, weight=1)
-        insights_frame.grid_columnconfigure(1, weight=1)
-        
-    def _create_weekly_activity_chart(self, parent) -> None:
-        """Create a weekly activity heatmap chart."""
+            ("Avg Session", f"{insights.get('average_session_length', 0):.1f} min", "⏱️"),
+        ])
+
+        # Charts: fixed per-section heights so the inner frame has a
+        # deterministic scrollable height; each figure resizes with the
+        # window width on <Configure>.
+        self._make_chart_section(parent, "Last 7 Days",
+                                 self._create_weekly_activity_chart, height=300)
+        self._make_chart_section(parent, "Last 14 Days",
+                                 self._create_word_count_chart, height=320)
+        self._make_chart_section(parent, "WPM Trend (Recent Sessions)",
+                                 self._create_wpm_trend_chart, height=320)
+
+    def _make_stat_strip(self, parent: ttk.Frame,
+                         items: List[Tuple[str, str, str]]) -> None:
+        """Render a row of equal-width metric cards that flex with width."""
+        strip = ttk.Frame(parent)
+        strip.pack(fill='x', pady=(0, 12))
+        for col, (label, value, icon) in enumerate(items):
+            card = ttk.Frame(strip, relief='raised', borderwidth=1, padding=10)
+            card.grid(row=0, column=col, sticky='nsew', padx=4)
+            strip.columnconfigure(col, weight=1, uniform='stat')
+            ttk.Label(card, text=f"{icon} {label}",
+                      font=('Arial', 10, 'bold')).pack(anchor='w')
+            ttk.Label(card, text=value,
+                      font=('Arial', 16, 'bold')).pack(anchor='w', pady=(4, 0))
+
+    def _make_chart_section(self, parent: ttk.Frame, title: str,
+                            render_fn, *, height: int) -> None:
+        """Create a fixed-height labeled frame and let render_fn fill it."""
+        section = ttk.LabelFrame(parent, text=title, padding=8)
+        section.pack(fill='x', pady=(6, 6))
+
+        host = ttk.Frame(section, height=height)
+        host.pack(fill='x')
+        # pack_propagate(False) pins the host to ``height`` px regardless
+        # of its children's preferred size, which keeps the scroll region
+        # predictable.
+        host.pack_propagate(False)
+
+        render_fn(host)
+
+    def _mount_figure(self, parent, fig: Figure) -> None:
+        """Pack a matplotlib figure into ``parent`` and keep it responsive.
+
+        Binds the parent's ``<Configure>`` event to resize the figure to
+        match the parent's current pixel dimensions (converted via DPI),
+        with a small debounce so we redraw once per drag-pause rather than
+        on every Tk resize tick. Also registers a teardown hook so the
+        figure is closed when the widget is destroyed.
+        """
+        tk_canvas = FigureCanvasTkAgg(fig, master=parent)
+        widget = tk_canvas.get_tk_widget()
+        widget.pack(fill='both', expand=True)
+        tk_canvas.draw()
+        self._active_figures.append(fig)
+
+        pending: List[str] = []
+
+        def _do_resize(width: int, height: int) -> None:
+            pending.clear()
+            if width <= 1 or height <= 1:
+                return
+            dpi = fig.get_dpi() or 100
+            new_w = max(1.5, width / dpi)
+            new_h = max(1.0, height / dpi)
+            fig.set_size_inches(new_w, new_h, forward=False)
+            try:
+                fig.tight_layout()
+            except Exception:
+                pass
+            tk_canvas.draw_idle()
+
+        def _on_configure(event) -> None:
+            for token in pending:
+                try:
+                    parent.after_cancel(token)
+                except Exception:
+                    pass
+            pending.clear()
+            pending.append(parent.after(80, _do_resize, event.width, event.height))
+
+        parent.bind('<Configure>', _on_configure, add='+')
+
+        def _on_destroy(_event) -> None:
+            for token in pending:
+                try:
+                    parent.after_cancel(token)
+                except Exception:
+                    pass
+            pending.clear()
+            try:
+                plt.close(fig)
+            except Exception:
+                pass
+            try:
+                self._active_figures.remove(fig)
+            except ValueError:
+                pass
+
+        parent.bind('<Destroy>', _on_destroy, add='+')
+
+    def _render_daily_bar_chart(
+        self,
+        parent,
+        *,
+        days: int,
+        title: str,
+        date_format: str,
+        color: str,
+        show_bar_labels: bool,
+        rotate_xticks: bool,
+    ) -> None:
+        """Shared scaffolding for 'last N days of word counts' bar charts.
+
+        Fetches N days of ``get_daily_stats`` and draws a bar chart that
+        resizes with its parent. Exceptions render inline so a chart bug
+        can't take down the dashboard.
+        """
         try:
-            fig = Figure(figsize=(10, 4))
+            fig = Figure()
             ax = fig.add_subplot(111)
 
-            dates = []
-            word_counts = []
-
-            for i in range(7):
+            dates: List[str] = []
+            word_counts: List[int] = []
+            for i in range(days):
                 day = datetime.now() - timedelta(days=i)
                 daily_stats = self.analytics.get_daily_stats(day)
-                dates.append(day.strftime('%A'))
+                dates.append(day.strftime(date_format))
                 word_counts.append(daily_stats["words_written"])
-
             dates.reverse()
             word_counts.reverse()
 
-            bars = ax.bar(dates, word_counts, color='skyblue', alpha=0.7)
+            bars = ax.bar(dates, word_counts, color=color, alpha=0.7)
 
-            mx = max(word_counts) if word_counts else 0
-            for bar, count in zip(bars, word_counts):
-                height = bar.get_height()
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2.0,
-                    height + max(mx * 0.01, 1.0),
-                    f'{count:,}', ha='center', va='bottom', fontsize=10
-                )
+            if show_bar_labels:
+                mx = max(word_counts) if word_counts else 0
+                for bar, count in zip(bars, word_counts):
+                    height = bar.get_height()
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        height + max(mx * 0.01, 1.0),
+                        f'{count:,}', ha='center', va='bottom', fontsize=10,
+                    )
 
-            ax.set_title('Last 7 Days Activity', fontsize=14, fontweight='bold')
+            ax.set_title(title, fontsize=13, fontweight='bold')
             ax.set_ylabel('Words Written')
-            ax.set_ylim(0, max(word_counts) * 1.1 if word_counts else 100)
+            if word_counts:
+                ax.set_ylim(0, max(word_counts) * 1.1 or 100)
+            else:
+                ax.set_ylim(0, 100)
+
+            if rotate_xticks:
+                ax.set_xlabel('Date')
+                for label in ax.get_xticklabels():
+                    label.set_rotation(45)
+                    label.set_ha('right')
 
             self._apply_palette_to_fig(fig, ax)
             fig.tight_layout()
-            canvas = FigureCanvasTkAgg(fig, master=parent)
-            canvas.draw()
-            tw = canvas.get_tk_widget()
-            tw.grid(row=0, column=0, sticky='nsew')
-            parent.bind('<Destroy>', lambda _e: plt.close(fig), add='+')
+            self._mount_figure(parent, fig)
 
         except Exception as e:
             ttk.Label(parent, text=f"Chart error: {e}").pack()
 
+    def _create_weekly_activity_chart(self, parent) -> None:
+        """Last-7-days bar chart keyed by day-of-week."""
+        self._render_daily_bar_chart(
+            parent,
+            days=7,
+            title='Last 7 Days Activity',
+            date_format='%A',
+            color='skyblue',
+            show_bar_labels=True,
+            rotate_xticks=False,
+        )
+
     def _create_wpm_trend_chart(self, parent) -> None:
-        """Create WPM trend chart."""
+        """Line chart of WPM over the most recent 20 sessions."""
         try:
-            fig = Figure(figsize=(8, 6))
+            fig = Figure()
             ax = fig.add_subplot(111)
 
-            recent_sessions = self.analytics.sessions[-20:] if len(self.analytics.sessions) >= 20 else self.analytics.sessions
+            recent_sessions = (self.analytics.sessions[-20:]
+                               if len(self.analytics.sessions) >= 20
+                               else self.analytics.sessions)
 
             if recent_sessions:
                 dates = [s.start_time.strftime('%m/%d') for s in recent_sessions]
                 wpm_values = [s.wpm for s in recent_sessions]
 
-                ax.plot(dates, wpm_values, marker='o', linewidth=2, markersize=6, color='green')
-                ax.set_title('WPM Trend', fontsize=12, fontweight='bold')
+                ax.plot(dates, wpm_values, marker='o', linewidth=2,
+                        markersize=6, color='green')
+                ax.set_title('WPM Trend', fontsize=13, fontweight='bold')
                 ax.set_ylabel('Words Per Minute')
                 ax.set_xlabel('Date')
                 for label in ax.get_xticklabels():
                     label.set_rotation(45)
                     label.set_ha('right')
             else:
-                ax.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax.transAxes)
-                ax.set_title('WPM Trend', fontsize=12, fontweight='bold')
+                ax.text(0.5, 0.5, 'No data available', ha='center', va='center',
+                        transform=ax.transAxes)
+                ax.set_title('WPM Trend', fontsize=13, fontweight='bold')
 
             self._apply_palette_to_fig(fig, ax)
             fig.tight_layout()
-            canvas = FigureCanvasTkAgg(fig, master=parent)
-            canvas.draw()
-            canvas.get_tk_widget().grid(row=0, column=0, sticky='nsew')
-            parent.bind('<Destroy>', lambda _e: plt.close(fig), add='+')
+            self._mount_figure(parent, fig)
 
         except Exception as e:
-            ttk.Label(parent, text=f"Chart error: {e}").grid(row=0, column=0)
+            ttk.Label(parent, text=f"Chart error: {e}").pack()
 
     def _create_word_count_chart(self, parent) -> None:
-        """Create daily word count chart."""
-        try:
-            fig = Figure(figsize=(8, 6))
-            ax = fig.add_subplot(111)
-
-            dates = []
-            word_counts = []
-
-            for i in range(14):
-                day = datetime.now() - timedelta(days=i)
-                daily_stats = self.analytics.get_daily_stats(day)
-                dates.append(day.strftime('%m/%d'))
-                word_counts.append(daily_stats["words_written"])
-
-            dates.reverse()
-            word_counts.reverse()
-
-            ax.bar(dates, word_counts, color='lightcoral', alpha=0.7)
-            ax.set_title('Daily Word Count', fontsize=12, fontweight='bold')
-            ax.set_ylabel('Words Written')
-            ax.set_xlabel('Date')
-            for label in ax.get_xticklabels():
-                label.set_rotation(45)
-                label.set_ha('right')
-
-            self._apply_palette_to_fig(fig, ax)
-            fig.tight_layout()
-            canvas = FigureCanvasTkAgg(fig, master=parent)
-            canvas.draw()
-            canvas.get_tk_widget().grid(row=0, column=0, sticky='nsew')
-            parent.bind('<Destroy>', lambda _e: plt.close(fig), add='+')
-
-        except Exception as e:
-            ttk.Label(parent, text=f"Chart error: {e}").grid(row=0, column=0)
+        """Last-14-days bar chart keyed by date."""
+        self._render_daily_bar_chart(
+            parent,
+            days=14,
+            title='Daily Word Count',
+            date_format='%m/%d',
+            color='lightcoral',
+            show_bar_labels=False,
+            rotate_xticks=True,
+        )
             
-    def _show_create_goal_dialog(self) -> None:
-        """Show dialog to create a new goal."""
-        dialog = tk.Toplevel(self.parent)
-        dialog.title("Create New Goal")
-        dialog.geometry("400x300")
-        dialog.transient(self.parent)
-        dialog.grab_set()
-        
-        # Goal type
-        ttk.Label(dialog, text="Goal Type:").pack(pady=5)
-        goal_type_var = tk.StringVar(value="daily")
-        ttk.Radiobutton(dialog, text="Daily", variable=goal_type_var, value="daily").pack()
-        ttk.Radiobutton(dialog, text="Weekly", variable=goal_type_var, value="weekly").pack()
-        ttk.Radiobutton(dialog, text="Monthly", variable=goal_type_var, value="monthly").pack()
-        
-        # Target words
-        ttk.Label(dialog, text="Target Words:").pack(pady=5)
-        target_var = tk.StringVar()
-        ttk.Entry(dialog, textvariable=target_var).pack(pady=5)
-        
-        # Duration (for weekly/monthly goals)
-        ttk.Label(dialog, text="Duration (days):").pack(pady=5)
-        duration_var = tk.StringVar(value="7")
-        ttk.Entry(dialog, textvariable=duration_var).pack(pady=5)
-        
-        def create_goal():
-            try:
-                target_words = int(target_var.get())
-                duration = int(duration_var.get())
-                goal_type = goal_type_var.get()
-                
-                start_date = datetime.now()
-                end_date = start_date + timedelta(days=duration)
-                
-                # This would create the goal in the goal manager
-                dialog.destroy()
-                
-            except ValueError:
-                messagebox.showerror("Error", "Please enter valid numbers")
-                
-        ttk.Button(dialog, text="Create Goal", command=create_goal).pack(pady=20)
 
 class SocialFeatures:
     """Social features for sharing and comparing with other writers."""
@@ -2615,6 +2763,11 @@ class SocialFeatures:
         """Get leaderboard for a challenge."""
         challenge = next((c for c in self.challenges if c["id"] == challenge_id), None)
         return challenge["leaderboard"] if challenge else []
+
+
+# ----------------------------------------------------------------------------
+# Main application window
+# ----------------------------------------------------------------------------
 
 class WordCountApp:
     def __init__(self, root: tk.Tk):
@@ -2988,6 +3141,9 @@ class WordCountApp:
         self.listener: Optional[keyboard.Listener] = None
         self._listener_lock = threading.Lock()
         self._current_focus_app: str = ""
+        self._im_denied = False
+        self._im_denied_logged = False
+        self._im_requested = False
         self.today_total = 0
         self.daily_goal = self.config.get("daily_goal", 1000)
         self.last_notification_time = 0
@@ -3308,6 +3464,51 @@ class WordCountApp:
         with self._listener_lock:
             if self.listener is not None:
                 return
+            # Defense in depth: callers are expected to gate on _should_listen()
+            # already (see _reconcile_listener), but re-check here so that any
+            # future call site can't accidentally start a listener when we
+            # shouldn't be listening (e.g. focus blur, paused, not recording).
+            # This keeps the privacy invariant "listener only runs while an
+            # allowlisted writing app is focused" structurally enforced.
+            if not self._should_listen():
+                return
+            # On macOS, starting pynput's Listener without Input Monitoring
+            # permission cached at process-start has been observed to abort()
+            # the interpreter (SIGABRT via _Py_FatalError) on
+            # Python 3.14 + pynput 1.8 + PyObjC 12 rather than raising a
+            # catchable exception. Pre-flight the grant with
+            # CGPreflightListenEventAccess and bail out cleanly if denied.
+            if IS_MACOS:
+                granted = mac_input_monitoring_granted()
+                if granted is False:
+                    if not self._im_denied_logged:
+                        self.logger.error(
+                            "Input Monitoring not granted for this process; "
+                            "refusing to start keyboard listener. Grant it in "
+                            "System Settings > Privacy & Security > Input "
+                            "Monitoring, then quit and relaunch WordCounterPro."
+                        )
+                        self._im_denied_logged = True
+                    # First time we notice IM missing, actively register this
+                    # process with TCC so WordCounterPro appears in the
+                    # Input Monitoring pane and the user sees the macOS
+                    # prompt. Guarded so we only do it once per session.
+                    if not self._im_requested:
+                        self._im_requested = True
+                        try:
+                            mac_request_input_monitoring()
+                            self.logger.info(
+                                "Requested Input Monitoring via TCC; "
+                                "user must toggle the grant and relaunch."
+                            )
+                        except Exception as e:
+                            self.logger.warning(
+                                f"mac_request_input_monitoring raised: {e}"
+                            )
+                    self._im_denied = True
+                    self.listener = None
+                    return
+                self._im_denied = False
             try:
                 self.listener = keyboard.Listener(on_press=self.on_key_press)
                 self.listener.start()
@@ -3354,6 +3555,9 @@ class WordCountApp:
             self.status_var.set("Paused")
             return
         if self.app_focus_manager.is_writing_context():
+            if IS_MACOS and self._im_denied:
+                self.status_var.set("Input Monitoring not granted - quit & relaunch after enabling it")
+                return
             focus = friendly_app_name(self._current_focus_app) or "writing app"
             self.status_var.set(f"Recording - {focus}")
         else:
@@ -3502,25 +3706,42 @@ class WordCountApp:
             pass
 
     def export_data(self):
-        """Export data to CSV or JSON."""
+        """Export data to CSV or JSON. Prompts for a destination path so the
+        file lands where the user wants (not the process CWD)."""
         try:
-            # Ask user for format
             format_choice = messagebox.askyesnocancel(
                 "Export Format",
                 "Choose export format:\n\nYes = CSV\nNo = JSON\nCancel = Cancel"
             )
-            
-            if format_choice is None:  # Cancel
+            if format_choice is None:
                 return
-                
             format_type = 'csv' if format_choice else 'json'
-            export_file = self.data_manager.export_data(format_type)
-            
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            default_name = f"word_count_export_{timestamp}.{format_type}"
+            default_dir = Path.home() / "Documents"
+            if not default_dir.is_dir():
+                default_dir = Path.home()
+            dest = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Export data",
+                defaultextension=f".{format_type}",
+                initialdir=str(default_dir),
+                initialfile=default_name,
+                filetypes=[
+                    ("CSV", "*.csv") if format_type == 'csv' else ("JSON", "*.json"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not dest:
+                return
+
+            export_file = self.data_manager.export_data(format_type, dest_path=Path(dest))
             if export_file:
                 messagebox.showinfo("Export Complete", f"Data exported to {export_file}")
             else:
                 messagebox.showwarning("No Data", "No data to export")
-                
+
         except Exception as e:
             self.logger.error(f"Error exporting data: {e}")
             messagebox.showerror("Error", "Failed to export data")
@@ -3717,8 +3938,9 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
             main_frame,
             text=(
                 "The keyboard listener only runs while one of these apps is focused.\n"
-                "When you switch to anything else, the listener stops and no keystrokes\n"
-                "reach this process. Add the writing apps you want tracked."
+                "When you switch away, the listener stops; any key events delivered\n"
+                "before it unwinds are ignored and never counted, logged, or stored.\n"
+                "Add the writing apps you want tracked."
             ),
             justify=tk.LEFT,
             wraplength=540,
@@ -3847,10 +4069,10 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
             "WordCounter is a writing-app tracker, not a keystroke logger.\n\n"
             "What we actually do:\n"
             "  - A foreground-window hook watches which app is focused.\n"
-            "  - The keyboard listener is only created while one of your\n"
-            "    allowlisted writing apps is focused. When you alt-tab to\n"
-            "    anything else, the listener is stopped and this process\n"
-            "    receives zero keystrokes.\n"
+            "  - The keyboard listener only runs while one of your allowlisted\n"
+            "    writing apps is focused. When you alt-tab anywhere else, the\n"
+            "    listener is stopped; any key events still delivered before it\n"
+            "    unwinds are ignored and never counted, logged, or stored.\n"
             "  - We only store aggregate counts (words, duration, WPM) per\n"
             "    session and per day.\n"
             "  - A short in-memory buffer holds the characters of the word you\n"
@@ -4029,6 +4251,10 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
         self.root.destroy()
 
 
+# ----------------------------------------------------------------------------
+# First-run onboarding wizard
+# ----------------------------------------------------------------------------
+
 class OnboardingWizard:
     """First-run wizard.
 
@@ -4145,11 +4371,11 @@ class OnboardingWizard:
             "Scrivener, and so on).\n\n"
             "How this is NOT a keylogger:\n\n"
             "  - A foreground-app hook watches which app is focused.\n"
-            "  - The keyboard listener is only created while one of your\n"
-            "    allowlisted writing apps is focused. When you switch to\n"
-            "    anything else (Chrome, Slack, your password manager, the\n"
-            "    terminal), the listener is stopped and this process\n"
-            "    receives zero keystrokes.\n\n"
+            "  - The keyboard listener only runs while one of your allowlisted\n"
+            "    writing apps is focused. When you switch to anything else\n"
+            "    (Chrome, Slack, your password manager, the terminal), the\n"
+            "    listener is stopped; any key events delivered before it\n"
+            "    unwinds are ignored and never counted, logged, or stored.\n\n"
             "  - Only aggregate counts (words, duration, WPM) are stored.\n"
             "    The typed word you are in the middle of stays in RAM only\n"
             "    until the next word boundary, then is discarded.\n\n"
@@ -4349,6 +4575,10 @@ class OnboardingWizard:
             self._clear()
             self.win.destroy()
 
+
+# ----------------------------------------------------------------------------
+# Entrypoint
+# ----------------------------------------------------------------------------
 
 def main():
     """Main entry point for the application."""
