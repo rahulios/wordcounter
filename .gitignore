@@ -18,7 +18,8 @@ env/
 # Build / dist / PyInstaller
 build/
 dist/
-*.spec
+# Hand-edited .spec files ARE tracked; only ignore PyInstaller's auto-generated
+# ones by matching the known generated names explicitly if/when they appear.
 
 # Installers / binaries
 *.exe
