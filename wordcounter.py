@@ -12,6 +12,10 @@ import logging
 import re
 import shutil
 import uuid
+import traceback
+import platform
+import urllib.parse
+import webbrowser
 from typing import Optional, Dict, Any, List, Tuple, Union, Deque
 from collections import deque
 import time
@@ -61,6 +65,126 @@ def migrate_legacy_data_to_app_dir(app_dir: Path) -> None:
             shutil.copytree(cwd_bak, dest_bak)
         except OSError:
             pass
+
+
+# Application version. Bump before each friends build.
+APP_VERSION = "0.2.0-validate"
+
+# Placeholder feedback email. Replace before distributing builds.
+FEEDBACK_EMAIL = "feedback@example.com"
+
+
+def crashes_dir() -> Path:
+    """Directory where crash logs are written."""
+    d = user_data_dir() / "crashes"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _crash_report_text(
+    exc_type,
+    exc_value,
+    exc_tb,
+    thread_name: str = "MainThread",
+) -> str:
+    """Build a crash-report string. Never includes typed text or window titles."""
+    try:
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    except Exception:
+        tb_text = f"{exc_type!r}: {exc_value!r}\n(traceback formatting failed)"
+
+    header = [
+        "WordCounter Crash Report",
+        "=" * 40,
+        f"Timestamp (local): {datetime.now().isoformat(timespec='seconds')}",
+        f"App version:       {APP_VERSION}",
+        f"Python:            {sys.version.split()[0]}",
+        f"Platform:          {platform.platform()}",
+        f"Thread:            {thread_name}",
+        "",
+        "Privacy notice: this report contains a stack trace and system info only.",
+        "No keystrokes, typed words, file contents, or window titles are attached.",
+        "",
+        "Traceback",
+        "-" * 40,
+    ]
+    return "\n".join(header) + "\n" + tb_text
+
+
+def write_crash_log(exc_type, exc_value, exc_tb, thread_name: str = "MainThread") -> Optional[Path]:
+    """Write a crash log to the crashes directory. Returns the log path or None on failure."""
+    try:
+        text = _crash_report_text(exc_type, exc_value, exc_tb, thread_name=thread_name)
+    except Exception:
+        return None
+    try:
+        d = crashes_dir()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = d / f"crash-{stamp}.log"
+        path.write_text(text, encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
+def _handle_uncaught_exception(exc_type, exc_value, exc_tb):
+    """Top-level excepthook: write a crash log, then fall through to default handler."""
+    try:
+        if not issubclass(exc_type, KeyboardInterrupt):
+            write_crash_log(exc_type, exc_value, exc_tb)
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _handle_thread_exception(args):
+    """threading.excepthook: capture crashes from background threads (Python 3.8+)."""
+    try:
+        thread_name = getattr(args.thread, "name", "UnknownThread")
+        write_crash_log(args.exc_type, args.exc_value, args.exc_traceback, thread_name=thread_name)
+    except Exception:
+        pass
+    try:
+        _original_threading_excepthook(args)
+    except Exception:
+        pass
+
+
+_original_threading_excepthook = threading.excepthook
+
+
+def install_crash_handlers() -> None:
+    """Install process-wide crash handlers. Safe to call more than once."""
+    sys.excepthook = _handle_uncaught_exception
+    try:
+        threading.excepthook = _handle_thread_exception
+    except AttributeError:
+        pass
+
+
+def build_feedback_mailto(body_extra: str = "") -> str:
+    """Construct a mailto: URL with app context in the body."""
+    lines = [
+        "Hi,",
+        "",
+        "(Your feedback here)",
+        "",
+        "---",
+        f"App version: {APP_VERSION}",
+        f"Python:      {sys.version.split()[0]}",
+        f"Platform:    {platform.platform()}",
+    ]
+    if body_extra:
+        lines += ["", body_extra]
+    body = "\n".join(lines)
+    params = {
+        "subject": f"WordCounter feedback (v{APP_VERSION})",
+        "body": body,
+    }
+    return "mailto:" + FEEDBACK_EMAIL + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
 
 
 # Add custom exception classes
@@ -494,37 +618,29 @@ class GoalManager:
         expected_progress = (elapsed_days / total_days) * goal.target_words
         return goal.current_progress >= expected_progress
 
-class SecurityManager:
-    """Manages security features to prevent logging sensitive data."""
-    
-    def __init__(self):
-        # Applications where word counting should be paused
-        self.excluded_apps = {
-            "chrome.exe", "firefox.exe", "edge.exe", "safari.exe",  # Browsers
-            "outlook.exe", "thunderbird.exe", "mail.exe",  # Email clients
-            "teams.exe", "slack.exe", "discord.exe", "zoom.exe",  # Communication apps
-            "putty.exe", "mobaxterm.exe", "securecrt.exe",  # SSH clients
-            "vpn.exe", "openvpn.exe", "nordvpn.exe",  # VPN clients
-            "keepass.exe", "1password.exe", "lastpass.exe", "bitwarden.exe",  # Password managers
-            "cmd.exe", "powershell.exe", "terminal.exe",  # Command line
-            "rdp.exe", "mstsc.exe",  # Remote desktop
-        }
-        
-        # Window titles containing sensitive keywords
-        self.sensitive_keywords = {
-            "password", "login", "sign in", "authentication", "security",
-            "credit card", "ssn", "social security", "bank", "account",
-            "private", "confidential", "secret", "secure"
-        }
-        
-        self.security_enabled = True
-        self.current_app = None
-        self.current_window_title = None
+class AppFocusManager:
+    """Tracks the focused application and enforces the writing-app allowlist.
+
+    The app is *not* a general keystroke logger: the keyboard listener is only
+    instantiated while an allowlisted writing app is the focused foreground
+    window. This class is the authority on "is the user currently in a
+    writing app?" and persists the allowlist via the shared Config.
+    """
+
+    def __init__(self, config: Optional["Config"] = None):
+        self._config = config
+        initial = config.get("allowed_apps", []) if config is not None else []
+        if not initial:
+            initial = list(Config.DEFAULT_ALLOWED_APPS) if hasattr(Config, "DEFAULT_ALLOWED_APPS") else []
+        self.allowed_apps: set = {a.lower() for a in initial}
+
+        self.current_app: Optional[str] = None
+        self.current_window_title: Optional[str] = None
         self._unknown_context_warned = False
-        # Cache sensitive-context checks per foreground hwnd (hot path: every keystroke)
+        # Cache writing-context checks per foreground hwnd (hot path: every keystroke)
         self._ctx_hwnd: Optional[int] = None
         self._ctx_mono: float = 0.0
-        self._ctx_sensitive: bool = True
+        self._ctx_is_writing: bool = False
 
     def _window_context_from_hwnd(self, hwnd: int) -> Tuple[str, str]:
         """Resolve process name and lowercased window title for a native window handle."""
@@ -545,55 +661,288 @@ class SecurityManager:
         except Exception:
             return "", ""
 
-    def is_sensitive_context(self) -> bool:
-        """Check if current context is sensitive and should be excluded."""
-        if not self.security_enabled:
-            return False
-
+    def is_writing_context(self) -> bool:
+        """Return True iff the focused foreground window is an allowlisted writing app."""
         try:
             hwnd = win32gui.GetForegroundWindow()
             now = time.monotonic()
             if hwnd == self._ctx_hwnd and (now - self._ctx_mono) < 1.0:
-                return self._ctx_sensitive
+                return self._ctx_is_writing
 
-            process_name, window_title = self._window_context_from_hwnd(hwnd)
-            if not process_name or not window_title:
+            process_name, _ = self._window_context_from_hwnd(hwnd)
+            if not process_name:
                 if not self._unknown_context_warned:
-                    logging.warning("Unable to determine active window context; pausing counting for safety.")
+                    logging.warning("Unable to determine active window context; treating as non-writing for safety.")
                     self._unknown_context_warned = True
-                sensitive = True
-            elif process_name in self.excluded_apps:
-                sensitive = True
+                is_writing = False
             else:
-                sensitive = any(kw in window_title for kw in self.sensitive_keywords)
+                is_writing = process_name in self.allowed_apps
 
             self._ctx_hwnd = hwnd
             self._ctx_mono = now
-            self._ctx_sensitive = sensitive
-            return sensitive
+            self._ctx_is_writing = is_writing
+            return is_writing
 
         except Exception:
-            return True
-    
+            return False
+
     def update_context(self) -> None:
-        """Update current application context."""
+        """Update current application context (for display / debug)."""
         self.current_app, self.current_window_title = self.get_active_window_info()
-    
-    def set_security_enabled(self, enabled: bool) -> None:
-        """Enable or disable security features."""
-        self.security_enabled = enabled
-    
-    def add_excluded_app(self, app_name: str) -> None:
-        """Add an application to the exclusion list."""
-        self.excluded_apps.add(app_name.lower())
-    
-    def remove_excluded_app(self, app_name: str) -> None:
-        """Remove an application from the exclusion list."""
-        self.excluded_apps.discard(app_name.lower())
-    
-    def get_excluded_apps(self) -> set:
-        """Get the current list of excluded applications."""
-        return self.excluded_apps.copy()
+
+    def _persist(self) -> None:
+        if self._config is None:
+            return
+        try:
+            self._config.set("allowed_apps", sorted(self.allowed_apps))
+            self._config.save_config()
+        except Exception as e:
+            logging.warning(f"Failed to persist allowed_apps: {e}")
+
+    def _invalidate_cache(self) -> None:
+        self._ctx_hwnd = None
+        self._ctx_mono = 0.0
+        self._ctx_is_writing = False
+
+    def add_allowed_app(self, app_name: str) -> None:
+        """Add an application to the writing-app allowlist."""
+        self.allowed_apps.add(app_name.lower())
+        self._invalidate_cache()
+        self._persist()
+
+    def remove_allowed_app(self, app_name: str) -> None:
+        """Remove an application from the writing-app allowlist."""
+        self.allowed_apps.discard(app_name.lower())
+        self._invalidate_cache()
+        self._persist()
+
+    def get_allowed_apps(self) -> set:
+        """Get the current writing-app allowlist."""
+        return self.allowed_apps.copy()
+
+    def set_allowed_apps(self, app_names) -> None:
+        """Replace the entire allowlist (used by onboarding / bulk edits)."""
+        self.allowed_apps = {a.lower() for a in app_names}
+        self._invalidate_cache()
+        self._persist()
+
+
+RUN_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_REGISTRY_VALUE_NAME = "WordCounterPro"
+
+
+# Human-readable display names for the apps the user is likely to see.
+# The allowlist is always stored as lowercase process names (*.exe); this map
+# only affects what gets rendered in the UI / status bar.
+FRIENDLY_APP_NAMES: Dict[str, str] = {
+    "winword.exe": "Microsoft Word",
+    "obsidian.exe": "Obsidian",
+    "evernote.exe": "Evernote",
+    "scrivener.exe": "Scrivener",
+    "notepad.exe": "Notepad",
+    "notepad++.exe": "Notepad++",
+    "sublime_text.exe": "Sublime Text",
+    "typora.exe": "Typora",
+    "wordpad.exe": "WordPad",
+    "onenote.exe": "OneNote",
+    "joplin.exe": "Joplin",
+    "logseq.exe": "Logseq",
+    "zettlr.exe": "Zettlr",
+    "ia writer.exe": "iA Writer",
+    "code.exe": "VS Code",
+    "cursor.exe": "Cursor",
+}
+
+
+def friendly_app_name(process_name: str) -> str:
+    """Return a human-readable display name for a Windows process name.
+
+    Known apps come from FRIENDLY_APP_NAMES. Unknown apps fall back to a
+    stripped, title-cased form (e.g. ``my_app.exe`` -> ``My App``).
+    """
+    if not process_name:
+        return ""
+    lower = process_name.lower().strip()
+    if lower in FRIENDLY_APP_NAMES:
+        return FRIENDLY_APP_NAMES[lower]
+    base = lower[:-4] if lower.endswith(".exe") else lower
+    base = base.replace("_", " ").replace("-", " ")
+    return base.title() if base else process_name
+
+
+def _build_startup_command() -> str:
+    """Build the command Windows should run at login to launch this app."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    script = Path(__file__).resolve()
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    interpreter = pythonw if pythonw.exists() else Path(sys.executable)
+    return f'"{interpreter}" "{script}"'
+
+
+def set_launch_on_startup(enable: bool) -> bool:
+    """Add or remove the HKCU Run registry entry for auto-launch. Returns success."""
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            if enable:
+                winreg.SetValueEx(k, RUN_REGISTRY_VALUE_NAME, 0, winreg.REG_SZ, _build_startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, RUN_REGISTRY_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception as e:
+        logging.warning(f"set_launch_on_startup failed: {e}")
+        return False
+
+
+def is_launch_on_startup() -> bool:
+    """Return True if the Run registry entry is currently present."""
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REGISTRY_KEY, 0, winreg.KEY_READ) as k:
+            try:
+                winreg.QueryValueEx(k, RUN_REGISTRY_VALUE_NAME)
+                return True
+            except FileNotFoundError:
+                return False
+    except Exception:
+        return False
+
+
+class FocusWatcher:
+    """Watches foreground-window changes via Win32 SetWinEventHook.
+
+    Runs a private Windows message loop in a daemon thread. On each
+    EVENT_SYSTEM_FOREGROUND event, resolves the focused process name and
+    schedules ``on_focus_change(process_name)`` back on the Tk main thread
+    via ``root.after``. Used to start/stop the pynput keyboard listener so
+    it's only instantiated while an allowlisted writing app is focused.
+    """
+
+    EVENT_SYSTEM_FOREGROUND = 0x0003
+    WINEVENT_OUTOFCONTEXT = 0x0000
+    WM_QUIT = 0x0012
+
+    def __init__(self, root: tk.Tk, on_focus_change):
+        self._root = root
+        self._on_focus_change = on_focus_change
+        self._thread: Optional[threading.Thread] = None
+        self._thread_id: int = 0
+        self._hook_id = None
+        self._proc = None  # keep a ref to the ctypes callback so it isn't GC'd
+        self._started = threading.Event()
+
+        import ctypes
+        from ctypes import wintypes
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._user32 = ctypes.windll.user32
+        self._kernel32 = ctypes.windll.kernel32
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="FocusWatcher", daemon=True)
+        self._thread.start()
+        self._started.wait(timeout=2.0)
+
+    def stop(self) -> None:
+        try:
+            if self._thread_id:
+                self._user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)
+        except Exception as e:
+            logging.warning(f"FocusWatcher.stop error: {e}")
+        finally:
+            self._thread = None
+
+    def _resolve_process_name(self, hwnd) -> str:
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return psutil.Process(pid).name().lower()
+        except Exception:
+            return ""
+
+    def _schedule(self, process_name: str) -> None:
+        try:
+            self._root.after(0, lambda p=process_name: self._on_focus_change(p))
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+
+        WinEventProcType = ctypes.WINFUNCTYPE(
+            None,
+            ctypes.c_void_p,   # hWinEventHook (HWINEVENTHOOK)
+            wintypes.DWORD,    # event
+            wintypes.HWND,     # hwnd
+            wintypes.LONG,     # idObject
+            wintypes.LONG,     # idChild
+            wintypes.DWORD,    # dwEventThread
+            wintypes.DWORD,    # dwmsEventTime
+        )
+
+        def _callback(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+            try:
+                process_name = self._resolve_process_name(hwnd)
+                self._schedule(process_name)
+            except Exception:
+                pass
+
+        self._proc = WinEventProcType(_callback)
+        self._thread_id = self._kernel32.GetCurrentThreadId()
+
+        self._user32.SetWinEventHook.restype = ctypes.c_void_p
+        self._user32.SetWinEventHook.argtypes = [
+            wintypes.DWORD, wintypes.DWORD,
+            wintypes.HMODULE, WinEventProcType,
+            wintypes.DWORD, wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        self._hook_id = self._user32.SetWinEventHook(
+            self.EVENT_SYSTEM_FOREGROUND,
+            self.EVENT_SYSTEM_FOREGROUND,
+            None,
+            self._proc,
+            0,
+            0,
+            self.WINEVENT_OUTOFCONTEXT,
+        )
+        if not self._hook_id:
+            logging.error("SetWinEventHook failed; focus tracking disabled.")
+            self._started.set()
+            return
+
+        self._started.set()
+        msg = wintypes.MSG()
+        try:
+            while True:
+                ret = self._user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                if ret == 0 or ret == -1:
+                    break
+                self._user32.TranslateMessage(ctypes.byref(msg))
+                self._user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            try:
+                self._user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
+                self._user32.UnhookWinEvent(self._hook_id)
+            except Exception:
+                pass
+            self._hook_id = None
+            self._proc = None
+
 
 @dataclass
 class SessionData:
@@ -657,17 +1006,38 @@ Keyboard Shortcuts:
 
 class Config:
     """Configuration management for the application."""
+    DEFAULT_ALLOWED_APPS = [
+        "winword.exe",       # Microsoft Word
+        "obsidian.exe",      # Obsidian
+        "evernote.exe",      # Evernote
+        "scrivener.exe",     # Scrivener
+        "notepad.exe",       # Windows Notepad
+        "notepad++.exe",     # Notepad++
+        "sublime_text.exe",  # Sublime Text
+        "typora.exe",        # Typora
+        "wordpad.exe",       # WordPad
+        "onenote.exe",       # OneNote (desktop)
+    ]
+
     DEFAULT_CONFIG = {
         "auto_save_interval": 300,  # seconds
         "data_flush_interval": 60,  # seconds
         "daily_goal": 1000,
-        "theme": "clam",
-        "window_geometry": "700x500",
+        # Windows-native ttk theme; falls back to 'clam' if unavailable.
+        "theme": "vista",
+        "window_geometry": "760x560",
         "show_notifications": True,
         "backup_enabled": True,
         "max_backup_files": 5,
         "min_word_length": 2,
-        "wpm_history_size": 10
+        "wpm_history_size": 10,
+        # Writing-app allowlist. The keyboard listener only runs while one
+        # of these process names is the focused foreground window.
+        "allowed_apps": list(DEFAULT_ALLOWED_APPS),
+        # First-run wizard gate. False => show wizard on next launch.
+        "onboarding_completed": False,
+        # Reconciled against HKCU\...\Run on each startup.
+        "launch_on_startup": False,
     }
     
     def __init__(self, config_file: Union[str, Path] = "config.json"):
@@ -788,14 +1158,16 @@ class WordDetector:
     })
     
     def __init__(self, min_word_length: int = 2):
+        # current_word is a transient buffer: it only holds characters between
+        # word separators and is cleared on every word completion, listener stop,
+        # focus change, pause, and stop_recording. No typed content persists.
         self.current_word = ""
         self.min_word_length = min_word_length
         self.word_pattern = re.compile(r'\b\w+\b')
-        self.word_count_cache = {}  # Cache for word validation
-        
+
         # Common word separators (only valid Key constants)
         self.separators = {Key.space, Key.enter, Key.tab}
-        
+
         # Valid word characters (including hyphens and apostrophes)
         self.word_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'")
         
@@ -825,29 +1197,20 @@ class WordDetector:
         return None
     
     def _check_word_completion(self) -> int:
-        """Check if current text forms a valid word with improved validation."""
-        word = self.current_word.strip()
+        """Check if current text forms a valid word. No caching: the typed word
+        must not live longer than this call for our privacy guarantees to hold.
+        """
+        word = self.current_word
         self.current_word = ""
-        
+
         if not word:
             return 0
-        
-        # Check cache first
-        if word in self.word_count_cache:
-            return self.word_count_cache[word]
-        
-        # Validate word
-        is_valid = self._is_valid_word(word)
-        word_count = 1 if is_valid else 0
-        
-        # Cache result for performance
-        self.word_count_cache[word] = word_count
-        
-        # Limit cache size to prevent memory issues
-        if len(self.word_count_cache) > 1000:
-            self.word_count_cache.clear()
-        
-        return word_count
+
+        word = word.strip()
+        if not word:
+            return 0
+
+        return 1 if self._is_valid_word(word) else 0
     
     def _is_valid_word(self, word: str) -> bool:
         """Validate if a word meets the criteria for counting."""
@@ -878,9 +1241,8 @@ class WordDetector:
         return word.lower() in self._COMMON_ABBREVS
     
     def reset(self) -> None:
-        """Reset the detector state."""
+        """Reset the detector state. Clears the transient current-word buffer."""
         self.current_word = ""
-        self.word_count_cache.clear()
 
 
 class Statistics:
@@ -1690,7 +2052,7 @@ class WordCountApp:
         self.statistics = Statistics(self.config.get("wpm_history_size", 10))
         self.app_state = AppState()
         self.keyboard_shortcuts = KeyboardShortcuts(self)
-        self.security_manager = SecurityManager()
+        self.app_focus_manager = AppFocusManager(self.config)
         self.analytics = AdvancedAnalytics()
         self.goal_manager = GoalManager(self.analytics)
         self.social_features = SocialFeatures()  # Initialize social features
@@ -1702,6 +2064,139 @@ class WordCountApp:
         self.setup_auto_save()
         self.update_display_timer()
         self.keyboard_shortcuts.bind_shortcuts()
+
+        # Start the foreground-window watcher. It runs for the app's lifetime
+        # and only triggers listener changes while the user is armed.
+        self.focus_watcher = FocusWatcher(self.root, self._on_focus_change)
+        self.focus_watcher.start()
+
+        # Reconcile the Windows Run registry entry against the saved pref.
+        try:
+            want = bool(self.config.get("launch_on_startup", False))
+            if want != is_launch_on_startup():
+                set_launch_on_startup(want)
+        except Exception as e:
+            self.logger.warning(f"Startup reconcile failed: {e}")
+
+        # If the user hasn't completed the onboarding wizard, show it shortly
+        # after the main window appears.
+        if not self.config.get("onboarding_completed", False):
+            self.root.after(200, self._show_onboarding)
+
+        # Offer to review crash logs from the previous run, if any.
+        self.root.after(1200, self._check_for_previous_crashes)
+
+    def _show_onboarding(self) -> None:
+        try:
+            OnboardingWizard(self.root, self)
+        except Exception as e:
+            self.logger.error(f"Failed to show onboarding: {e}")
+
+    def _list_crash_logs(self) -> List[Path]:
+        """Return crash .log files, newest first."""
+        try:
+            d = crashes_dir()
+            return sorted(
+                (p for p in d.glob("crash-*.log") if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return []
+
+    def _check_for_previous_crashes(self) -> None:
+        """If crash logs exist, offer the user to view or email them. Shown once per launch."""
+        if getattr(self, "_crash_prompt_shown", False):
+            return
+        self._crash_prompt_shown = True
+        logs = self._list_crash_logs()
+        if not logs:
+            return
+        newest = logs[0]
+        msg = (
+            f"WordCounter found {len(logs)} crash log(s) from previous runs.\n\n"
+            f"Most recent: {newest.name}\n\n"
+            "The logs contain a stack trace and system info only — no typed words, "
+            "file contents, or window titles.\n\n"
+            "Would you like to open the crash folder so you can review or email them?"
+        )
+        try:
+            if messagebox.askyesno("Previous crash detected", msg, parent=self.root):
+                self.open_crash_logs_folder()
+        except Exception as e:
+            self.logger.warning(f"Crash prompt failed: {e}")
+
+    def open_crash_logs_folder(self) -> None:
+        """Open the crashes directory in Windows Explorer."""
+        d = crashes_dir()
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(d))  # type: ignore[attr-defined]
+            else:
+                webbrowser.open(d.as_uri())
+        except Exception as e:
+            self.logger.warning(f"Failed to open crashes folder: {e}")
+            messagebox.showinfo(
+                "Crash logs",
+                f"Crash logs are stored at:\n{d}",
+                parent=self.root,
+            )
+
+    def show_feedback_dialog(self) -> None:
+        """Show a feedback dialog that composes a mailto: link."""
+        win = tk.Toplevel(self.root)
+        win.title("Send Feedback")
+        win.geometry("560x440")
+        win.transient(self.root)
+        win.grab_set()
+
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text="Tell us what's working, what's broken, or what you'd like next.",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        ttk.Label(
+            frame,
+            text=(
+                "We only send what you type below, plus the app version and OS. "
+                "No typed words, file contents, or window titles."
+            ),
+            wraplength=520,
+            justify=tk.LEFT,
+            foreground="#555",
+        ).pack(anchor=tk.W, pady=(4, 8))
+
+        text = tk.Text(frame, height=12, wrap=tk.WORD, font=("Segoe UI", 10))
+        text.pack(fill=tk.BOTH, expand=True)
+        text.focus_set()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(10, 0))
+
+        def do_send() -> None:
+            user_text = text.get("1.0", tk.END).strip()
+            body_extra = f"User note:\n{user_text}" if user_text else ""
+            url = build_feedback_mailto(body_extra=body_extra)
+            try:
+                webbrowser.open(url)
+            except Exception as e:
+                self.logger.warning(f"Failed to open mailto: {e}")
+                messagebox.showinfo(
+                    "Send Feedback",
+                    f"Could not open your email client automatically.\n\n"
+                    f"Please email {FEEDBACK_EMAIL} with:\n\n{user_text}",
+                    parent=win,
+                )
+                return
+            win.destroy()
+
+        ttk.Button(btns, text="Open Email", command=do_send).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
 
     def setup_logging(self) -> None:
         """Configure logging for the application."""
@@ -1722,21 +2217,67 @@ class WordCountApp:
         """Configure the root window properties."""
         self.root.title("Word Counter Pro")
         self.root.geometry(self.config.get("window_geometry"))
-        self.root.minsize(600, 400)
-        
-        # Configure style
+        self.root.minsize(720, 520)
+
+        # ttk theme: prefer the configured one, then the native Windows theme,
+        # then a clean cross-platform fallback.
         self.style = ttk.Style()
-        self.style.theme_use(self.config.get("theme"))
-        
-        # Custom styles
-        self.style.configure("Title.TLabel", font=("Helvetica", 14, "bold"))
-        self.style.configure("Stats.TLabel", font=("Helvetica", 11))
-        self.style.configure("Success.TLabel", foreground="green")
-        self.style.configure("Warning.TLabel", foreground="orange")
+        available = set(self.style.theme_names())
+        preferred = [self.config.get("theme"), "vista", "xpnative", "clam", "default"]
+        for name in preferred:
+            if name in available:
+                try:
+                    self.style.theme_use(name)
+                    break
+                except tk.TclError:
+                    continue
+
+        # Unified typography. Segoe UI is the Windows system font; falls back
+        # gracefully on other platforms.
+        base_family = "Segoe UI"
+        self.root.option_add("*Font", (base_family, 10))
+        self.style.configure(".", font=(base_family, 10))
+        self.style.configure("TLabel", font=(base_family, 10))
+        self.style.configure("TButton", font=(base_family, 10), padding=(12, 6))
+        self.style.configure("TLabelframe.Label", font=(base_family, 10, "bold"))
+        self.style.configure("TMenubutton", font=(base_family, 10))
+
+        # Hero header styles.
+        self.style.configure("Hero.TLabel", font=(base_family, 20, "bold"))
+        self.style.configure("HeroSub.TLabel", font=(base_family, 10), foreground="#666666")
+
+        # Stats: label vs value contrast.
+        self.style.configure("StatLabel.TLabel", font=(base_family, 10), foreground="#555555")
+        self.style.configure("StatValue.TLabel", font=(base_family, 16, "bold"))
+        self.style.configure("StatValueMuted.TLabel", font=(base_family, 14))
+
+        # Legacy aliases used elsewhere in the app.
+        self.style.configure("Title.TLabel", font=(base_family, 14, "bold"))
+        self.style.configure("Stats.TLabel", font=(base_family, 11))
+        self.style.configure("Success.TLabel", foreground="#1e8e3e")
+        self.style.configure("Warning.TLabel", foreground="#d97706")
+
+        # Primary action button (used for Start Recording).
+        self.style.configure(
+            "Accent.TButton",
+            font=(base_family, 10, "bold"),
+            padding=(14, 8),
+        )
+
+        # Status bar: flat, padded, subtle tint.
+        self.style.configure(
+            "StatusBar.TLabel",
+            font=(base_family, 9),
+            background="#f2f2f2",
+            foreground="#333333",
+            padding=(10, 6),
+        )
 
     def initialize_variables(self) -> None:
         """Initialize instance variables."""
         self.listener: Optional[keyboard.Listener] = None
+        self._listener_lock = threading.Lock()
+        self._current_focus_app: str = ""
         self.today_total = 0
         self.daily_goal = self.config.get("daily_goal", 1000)
         self.last_notification_time = 0
@@ -1749,16 +2290,25 @@ class WordCountApp:
     def create_ui(self) -> None:
         """Create the user interface with improved layout."""
         # Main container
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root, padding=(18, 16, 18, 12))
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
-        
-        # Title
-        title_label = ttk.Label(main_frame, text="Word Counter Pro", style="Title.TLabel")
-        title_label.grid(row=0, column=0, pady=(0, 10))
-        
+
+        # Hero header
+        header = ttk.Frame(main_frame)
+        header.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 14))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Word Counter Pro", style="Hero.TLabel").grid(
+            row=0, column=0, sticky=tk.W
+        )
+        ttk.Label(
+            header,
+            text="Tracks words only inside your writing apps. Nothing else.",
+            style="HeroSub.TLabel",
+        ).grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+
         # Statistics Frame
         self.create_statistics_frame(main_frame)
         
@@ -1776,37 +2326,35 @@ class WordCountApp:
 
     def create_statistics_frame(self, parent):
         """Create the statistics display frame."""
-        stats_frame = ttk.LabelFrame(parent, text="Statistics", padding="10")
-        stats_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        stats_frame = ttk.LabelFrame(parent, text="Statistics", padding=(14, 10))
+        stats_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=6)
         stats_frame.columnconfigure(1, weight=1)
-        
-        # Current Session
-        ttk.Label(stats_frame, text="Current Session:", style="Stats.TLabel").grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 10)
+
+        row_pady = (2, 2)
+
+        ttk.Label(stats_frame, text="Current session", style="StatLabel.TLabel").grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
         )
-        self.session_count_label = ttk.Label(stats_frame, text="0 words", style="Stats.TLabel")
-        self.session_count_label.grid(row=0, column=1, sticky=tk.W)
-        
-        # Today's Total
-        ttk.Label(stats_frame, text="Today's Total:", style="Stats.TLabel").grid(
-            row=1, column=0, sticky=tk.W, padx=(0, 10)
+        self.session_count_label = ttk.Label(stats_frame, text="0 words", style="StatValue.TLabel")
+        self.session_count_label.grid(row=0, column=1, sticky=tk.W, pady=row_pady)
+
+        ttk.Label(stats_frame, text="Today's total", style="StatLabel.TLabel").grid(
+            row=1, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
         )
-        self.today_count_label = ttk.Label(stats_frame, text="0 words", style="Stats.TLabel")
-        self.today_count_label.grid(row=1, column=1, sticky=tk.W)
-        
-        # WPM
-        ttk.Label(stats_frame, text="Words/Minute:", style="Stats.TLabel").grid(
-            row=2, column=0, sticky=tk.W, padx=(0, 10)
+        self.today_count_label = ttk.Label(stats_frame, text="0 words", style="StatValue.TLabel")
+        self.today_count_label.grid(row=1, column=1, sticky=tk.W, pady=row_pady)
+
+        ttk.Label(stats_frame, text="Words / minute", style="StatLabel.TLabel").grid(
+            row=2, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
         )
-        self.wpm_label = ttk.Label(stats_frame, text="0 WPM", style="Stats.TLabel")
-        self.wpm_label.grid(row=2, column=1, sticky=tk.W)
-        
-        # Session Duration
-        ttk.Label(stats_frame, text="Session Time:", style="Stats.TLabel").grid(
-            row=3, column=0, sticky=tk.W, padx=(0, 10)
+        self.wpm_label = ttk.Label(stats_frame, text="0 WPM", style="StatValueMuted.TLabel")
+        self.wpm_label.grid(row=2, column=1, sticky=tk.W, pady=row_pady)
+
+        ttk.Label(stats_frame, text="Session time", style="StatLabel.TLabel").grid(
+            row=3, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
         )
-        self.duration_label = ttk.Label(stats_frame, text="00:00:00", style="Stats.TLabel")
-        self.duration_label.grid(row=3, column=1, sticky=tk.W)
+        self.duration_label = ttk.Label(stats_frame, text="00:00:00", style="StatValueMuted.TLabel")
+        self.duration_label.grid(row=3, column=1, sticky=tk.W, pady=row_pady)
 
     def create_progress_frame(self, parent):
         """Create the progress display frame."""
@@ -1849,36 +2397,37 @@ class WordCountApp:
     def create_control_frame(self, parent):
         """Create the control buttons frame."""
         control_frame = ttk.Frame(parent)
-        control_frame.grid(row=3, column=0, pady=20)
-        
-        # Start Button
+        control_frame.grid(row=3, column=0, pady=(18, 10))
+
+        # Start Button (primary action)
         self.start_button = ttk.Button(
             control_frame,
-            text="▶ Start Recording",
+            text="▶  Start Recording",
             command=self.start_recording,
-            width=20
+            width=20,
+            style="Accent.TButton",
         )
-        self.start_button.grid(row=0, column=0, padx=5)
-        
+        self.start_button.grid(row=0, column=0, padx=6)
+
         # Pause Button
         self.pause_button = ttk.Button(
             control_frame,
-            text="⏸ Pause",
+            text="⏸  Pause",
             command=self.toggle_pause,
             state=tk.DISABLED,
-            width=20
+            width=18,
         )
-        self.pause_button.grid(row=0, column=1, padx=5)
-        
+        self.pause_button.grid(row=0, column=1, padx=6)
+
         # Stop Button
         self.stop_button = ttk.Button(
             control_frame,
-            text="⏹ Stop",
+            text="⏹  Stop",
             command=self.stop_recording,
             state=tk.DISABLED,
-            width=20
+            width=18,
         )
-        self.stop_button.grid(row=0, column=2, padx=5)
+        self.stop_button.grid(row=0, column=2, padx=6)
 
     def create_status_bar(self, parent):
         """Create the status bar."""
@@ -1886,10 +2435,10 @@ class WordCountApp:
         status_bar = ttk.Label(
             parent,
             textvariable=self.status_var,
-            relief=tk.SUNKEN,
-            anchor=tk.W
+            style="StatusBar.TLabel",
+            anchor=tk.W,
         )
-        status_bar.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+        status_bar.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(12, 0))
 
     def create_menu_bar(self):
         """Create the menu bar."""
@@ -1916,7 +2465,8 @@ class WordCountApp:
         # Tools Menu
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Security Settings", command=self.show_security_settings)
+        tools_menu.add_command(label="Writing Apps...", command=self.show_writing_apps_settings)
+        tools_menu.add_command(label="About Privacy...", command=self.show_privacy_dialog)
         tools_menu.add_separator()
         tools_menu.add_command(label="Keyboard Shortcuts", command=self.keyboard_shortcuts.show_shortcuts_help)
         tools_menu.add_separator()
@@ -1925,6 +2475,9 @@ class WordCountApp:
         # Help Menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="Send Feedback...", command=self.show_feedback_dialog)
+        help_menu.add_command(label="Open Crash Logs Folder", command=self.open_crash_logs_folder)
+        help_menu.add_separator()
         help_menu.add_command(label="About", command=self.show_about)
 
     def update_display(self):
@@ -1980,13 +2533,16 @@ class WordCountApp:
             self.statistics.add_words(pending)
 
     def on_key_press(self, key):
-        """Handle keyboard input with security checks."""
+        """Handle keyboard input. Belt-and-suspenders allowlist check.
+
+        Under the strong-allowlist model the listener should already be stopped
+        whenever the user is not in a writing app (see FocusWatcher). This check
+        is a defensive guard for the moment between focus-change events.
+        """
         if self.app_state.recording and not self.app_state.paused:
-            # Check if we're in a sensitive context
-            if self.security_manager.is_sensitive_context():
-                # Don't process keystrokes in sensitive contexts
+            if not self.app_focus_manager.is_writing_context():
                 return
-            
+
             word_count = self.word_detector.process_key(key)
             if word_count:
                 with self._pending_word_lock:
@@ -2010,24 +2566,86 @@ class WordCountApp:
             f"Congratulations! You've reached your daily goal of {self.daily_goal} words!"
         )
 
+    def _should_listen(self) -> bool:
+        """True iff we should currently have a keyboard listener running."""
+        return (
+            self.app_state.recording
+            and not self.app_state.paused
+            and self.app_focus_manager.is_writing_context()
+        )
+
+    def _ensure_listener_running(self) -> None:
+        with self._listener_lock:
+            if self.listener is not None:
+                return
+            try:
+                self.listener = keyboard.Listener(on_press=self.on_key_press)
+                self.listener.start()
+                self.logger.info(f"Listener started (focus={self._current_focus_app or 'unknown'})")
+            except Exception as e:
+                self.logger.error(f"Failed to start keyboard listener: {e}")
+                self.listener = None
+
+    def _ensure_listener_stopped(self) -> None:
+        with self._listener_lock:
+            if self.listener is None:
+                return
+            try:
+                self.listener.stop()
+            except Exception as e:
+                self.logger.warning(f"Error stopping listener: {e}")
+            self.listener = None
+            # The in-memory current-word buffer must not survive a focus blur.
+            try:
+                self.word_detector.reset()
+            except Exception:
+                pass
+            self.logger.info("Listener stopped")
+
+    def _reconcile_listener(self) -> None:
+        """Make the listener's running state match _should_listen()."""
+        if self._should_listen():
+            self._ensure_listener_running()
+        else:
+            self._ensure_listener_stopped()
+
+    def _on_focus_change(self, process_name: str) -> None:
+        """Called on the Tk main thread when the foreground window changes."""
+        self._current_focus_app = process_name or ""
+        self.app_focus_manager._invalidate_cache()
+        self._reconcile_listener()
+        self._update_status_bar()
+
+    def _update_status_bar(self) -> None:
+        if not self.app_state.recording:
+            self.status_var.set("Ready")
+            return
+        if self.app_state.paused:
+            self.status_var.set("Paused")
+            return
+        if self.app_focus_manager.is_writing_context():
+            focus = friendly_app_name(self._current_focus_app) or "writing app"
+            self.status_var.set(f"Recording - {focus}")
+        else:
+            self.status_var.set("Armed - waiting for a writing app...")
+
     def start_recording(self):
-        """Start the recording session."""
+        """Arm the recorder. The keyboard listener will run only while a writing app is focused."""
         try:
-            # Initialize statistics
             self.statistics.start_session()
-            
-            # Start keyboard listener
-            self.listener = keyboard.Listener(on_press=self.on_key_press)
-            self.listener.start()
-            
-            # Update state
+
             self.app_state.recording = True
             self.app_state.paused = False
+
+            self.app_focus_manager.update_context()
+            self._current_focus_app = self.app_focus_manager.current_app or ""
+
+            self._reconcile_listener()
             self.update_button_states()
-            self.status_var.set("Recording...")
-            
-            self.logger.info("Recording started")
-            
+            self._update_status_bar()
+
+            self.logger.info("Recording armed")
+
         except Exception as e:
             self.logger.error(f"Error starting recording: {e}")
             messagebox.showerror("Error", "Failed to start recording")
@@ -2036,18 +2654,15 @@ class WordCountApp:
         """Toggle pause state."""
         self.app_state.paused = not self.app_state.paused
         self.pause_button.config(text="▶ Resume" if self.app_state.paused else "⏸ Pause")
-        self.status_var.set("Paused" if self.app_state.paused else "Recording...")
+        self._reconcile_listener()
+        self._update_status_bar()
         self.logger.info(f"Recording {'paused' if self.app_state.paused else 'resumed'}")
 
     def stop_recording(self):
         """Stop the recording session."""
         try:
-            # Stop listener
-            if self.listener:
-                self.listener.stop()
-                self.listener = None
-            
-            # Save session if there are words
+            self._ensure_listener_stopped()
+
             session_data = self.statistics.get_session_data()
             if session_data.word_count > 0:
                 # Update session duration before saving
@@ -2081,8 +2696,8 @@ class WordCountApp:
             
             self.update_button_states()
             self.update_display()
-            self.status_var.set("Ready")
-            
+            self._update_status_bar()
+
             self.logger.info("Recording stopped")
             
         except Exception as e:
@@ -2124,7 +2739,7 @@ class WordCountApp:
                 if self.data_manager.save_session(session_data):
                     self.data_manager.flush_pending(force=False)
                     self.status_var.set("Auto-saved")
-                    self.root.after(2000, lambda: self.status_var.set("Recording..."))
+                    self.root.after(2000, self._update_status_bar)
                     self.logger.info("Auto-save completed")
                 else:
                     self.logger.warning("Auto-save failed")
@@ -2351,127 +2966,181 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
             self.logger.error(f"Error showing history: {e}")
             ttk.Label(main_frame, text="Error loading history", foreground="red").pack(pady=20)
 
-    def show_security_settings(self):
-        """Show security settings dialog."""
-        security_window = tk.Toplevel(self.root)
-        security_window.title("Security Settings")
-        security_window.geometry("600x500")
-        security_window.resizable(False, False)
-        security_window.transient(self.root)
-        security_window.grab_set()
-        
-        # Center the window
-        security_window.update_idletasks()
-        x = (security_window.winfo_screenwidth() // 2) - (600 // 2)
-        y = (security_window.winfo_screenheight() // 2) - (500 // 2)
-        security_window.geometry(f"600x500+{x}+{y}")
-        
-        # Main frame
-        main_frame = ttk.Frame(security_window, padding="20")
+    def show_writing_apps_settings(self):
+        """Show the writing-app allowlist settings dialog."""
+        win = tk.Toplevel(self.root)
+        win.title("Writing Apps")
+        win.geometry("600x520")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() // 2) - (600 // 2)
+        y = (win.winfo_screenheight() // 2) - (520 // 2)
+        win.geometry(f"600x520+{x}+{y}")
+
+        main_frame = ttk.Frame(win, padding="20")
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Security enabled checkbox
-        security_enabled_var = tk.BooleanVar(value=self.security_manager.security_enabled)
-        security_checkbox = ttk.Checkbutton(
+
+        intro = ttk.Label(
             main_frame,
-            text="Enable Security Features",
-            variable=security_enabled_var,
-            command=lambda: self.security_manager.set_security_enabled(security_enabled_var.get())
+            text=(
+                "The keyboard listener only runs while one of these apps is focused.\n"
+                "When you switch to anything else, the listener stops and no keystrokes\n"
+                "reach this process. Add the writing apps you want tracked."
+            ),
+            justify=tk.LEFT,
+            wraplength=540,
         )
-        security_checkbox.pack(anchor=tk.W, pady=(0, 20))
-        
-        # Excluded applications frame
-        excluded_frame = ttk.LabelFrame(main_frame, text="Excluded Applications", padding="10")
-        excluded_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 20))
-        
-        # List of excluded apps
-        excluded_listbox = tk.Listbox(excluded_frame, height=8)
-        excluded_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Scrollbar for listbox
-        scrollbar = ttk.Scrollbar(excluded_frame, orient=tk.VERTICAL, command=excluded_listbox.yview)
+        intro.pack(anchor=tk.W, pady=(0, 15))
+
+        allowed_frame = ttk.LabelFrame(main_frame, text="Allowed Writing Apps", padding="10")
+        allowed_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+
+        list_row = ttk.Frame(allowed_frame)
+        list_row.pack(fill=tk.BOTH, expand=True)
+
+        allowed_listbox = tk.Listbox(list_row, height=10)
+        allowed_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(list_row, orient=tk.VERTICAL, command=allowed_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        excluded_listbox.config(yscrollcommand=scrollbar.set)
-        
-        # Buttons frame
-        buttons_frame = ttk.Frame(excluded_frame)
+        allowed_listbox.config(yscrollcommand=scrollbar.set)
+
+        buttons_frame = ttk.Frame(allowed_frame)
         buttons_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        def add_excluded_app():
-            app_name = simpledialog.askstring("Add Application", "Enter application name (e.g., chrome.exe):")
+
+        # Parallel list mirroring the listbox rows -> process names, since the
+        # listbox displays friendly labels but the allowlist is keyed on *.exe.
+        row_process_names: List[str] = []
+
+        def refresh_allowed_list():
+            allowed_listbox.delete(0, tk.END)
+            row_process_names.clear()
+            pairs = [(friendly_app_name(p), p) for p in self.app_focus_manager.get_allowed_apps()]
+            pairs.sort(key=lambda pr: pr[0].lower())
+            for label, process_name in pairs:
+                allowed_listbox.insert(tk.END, label)
+                row_process_names.append(process_name)
+
+        def add_app():
+            app_name = simpledialog.askstring(
+                "Add Writing App",
+                "Enter the executable name (e.g., obsidian.exe):",
+                parent=win,
+            )
             if app_name:
-                self.security_manager.add_excluded_app(app_name)
-                refresh_excluded_list()
-        
-        def remove_excluded_app():
-            selection = excluded_listbox.curselection()
+                name = app_name.strip().lower()
+                if name and not name.endswith(".exe"):
+                    name = name + ".exe"
+                if name:
+                    self.app_focus_manager.add_allowed_app(name)
+                    refresh_allowed_list()
+
+        def remove_app():
+            selection = allowed_listbox.curselection()
             if selection:
-                app_name = excluded_listbox.get(selection[0])
-                self.security_manager.remove_excluded_app(app_name)
-                refresh_excluded_list()
-        
-        def refresh_excluded_list():
-            excluded_listbox.delete(0, tk.END)
-            for app in sorted(self.security_manager.get_excluded_apps()):
-                excluded_listbox.insert(tk.END, app)
-        
-        ttk.Button(buttons_frame, text="Add Application", command=add_excluded_app).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(buttons_frame, text="Remove Selected", command=remove_excluded_app).pack(side=tk.LEFT)
-        
-        # Sensitive keywords frame
-        keywords_frame = ttk.LabelFrame(main_frame, text="Sensitive Keywords", padding="10")
-        keywords_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 20))
-        
-        keywords_text = tk.Text(keywords_frame, height=4, wrap=tk.WORD)
-        keywords_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Load current keywords
-        keywords_text.insert(tk.END, ", ".join(self.security_manager.sensitive_keywords))
-        
-        def save_keywords():
-            keywords_text_content = keywords_text.get(1.0, tk.END).strip()
-            if keywords_text_content:
-                keywords = {kw.strip().lower() for kw in keywords_text_content.split(",")}
-                self.security_manager.sensitive_keywords = keywords
-        
-        # Current context frame
-        context_frame = ttk.LabelFrame(main_frame, text="Current Context", padding="10")
-        context_frame.pack(fill=tk.X, pady=(0, 20))
-        
-        self.context_label = ttk.Label(context_frame, text="Click 'Update' to see current application context")
+                idx = selection[0]
+                if 0 <= idx < len(row_process_names):
+                    self.app_focus_manager.remove_allowed_app(row_process_names[idx])
+                    refresh_allowed_list()
+
+        def reset_defaults():
+            if messagebox.askyesno(
+                "Reset to defaults",
+                "Replace the allowlist with the shipped default writing apps?",
+                parent=win,
+            ):
+                self.app_focus_manager.set_allowed_apps(Config.DEFAULT_ALLOWED_APPS)
+                refresh_allowed_list()
+
+        ttk.Button(buttons_frame, text="Add...", command=add_app).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(buttons_frame, text="Remove Selected", command=remove_app).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(buttons_frame, text="Reset to Defaults", command=reset_defaults).pack(side=tk.LEFT)
+
+        context_frame = ttk.LabelFrame(main_frame, text="Current Focus", padding="10")
+        context_frame.pack(fill=tk.X, pady=(0, 15))
+
+        self.context_label = ttk.Label(context_frame, text="Click 'Refresh' to inspect the focused window.")
         self.context_label.pack(anchor=tk.W)
-        
+
         def update_context():
-            self.security_manager.update_context()
-            app_name = self.security_manager.current_app or "Unknown"
-            window_title = self.security_manager.current_window_title or "Unknown"
-            is_sensitive = self.security_manager.is_sensitive_context()
-            
-            context_text = f"Application: {app_name}\nWindow: {window_title}\nSensitive: {'Yes' if is_sensitive else 'No'}"
-            self.context_label.config(text=context_text)
-        
-        ttk.Button(context_frame, text="Update Context", command=update_context).pack(anchor=tk.W, pady=(5, 0))
-        
-        # Bottom buttons
+            self.app_focus_manager.update_context()
+            app_name = self.app_focus_manager.current_app or ""
+            window_title = self.app_focus_manager.current_window_title or "Unknown"
+            is_writing = self.app_focus_manager.is_writing_context()
+            friendly = friendly_app_name(app_name) if app_name else "Unknown"
+            app_line = f"{friendly} ({app_name})" if app_name else "Unknown"
+            self.context_label.config(text=(
+                f"Application: {app_line}\n"
+                f"Window:      {window_title}\n"
+                f"In writing app: {'Yes' if is_writing else 'No'}"
+            ))
+
+        ttk.Button(context_frame, text="Refresh", command=update_context).pack(anchor=tk.W, pady=(5, 0))
+
         bottom_frame = ttk.Frame(main_frame)
-        bottom_frame.pack(fill=tk.X, pady=(20, 0))
-        
-        def save_settings():
-            save_keywords()
-            messagebox.showinfo("Success", "Security settings saved!")
-        
-        def close_dialog():
-            save_settings()
-            security_window.destroy()
-        
-        ttk.Button(bottom_frame, text="Save", command=save_settings).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(bottom_frame, text="Cancel", command=security_window.destroy).pack(side=tk.RIGHT)
-        
-        # Initialize the excluded apps list
-        refresh_excluded_list()
-        
-        # Update context initially
+        bottom_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(bottom_frame, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+
+        refresh_allowed_list()
         update_context()
+
+    def show_privacy_dialog(self):
+        """Show an explicit privacy statement. Designed to be the answer to
+        'what are you actually doing with my keystrokes?'."""
+        win = tk.Toplevel(self.root)
+        win.title("Privacy")
+        win.geometry("620x520")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() // 2) - (620 // 2)
+        y = (win.winfo_screenheight() // 2) - (520 // 2)
+        win.geometry(f"620x520+{x}+{y}")
+
+        main = ttk.Frame(win, padding="20")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main, text="Privacy", font=("Helvetica", 16, "bold")).pack(anchor=tk.W, pady=(0, 10))
+
+        bg = self.root.cget("bg")
+        body = tk.Text(main, wrap=tk.WORD, height=20, relief=tk.FLAT,
+                       background=bg, borderwidth=0)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        statement = (
+            "WordCounter is a writing-app tracker, not a keystroke logger.\n\n"
+            "What we actually do:\n"
+            "  - A foreground-window hook watches which app is focused.\n"
+            "  - The keyboard listener is only created while one of your\n"
+            "    allowlisted writing apps is focused. When you alt-tab to\n"
+            "    anything else, the listener is stopped and this process\n"
+            "    receives zero keystrokes.\n"
+            "  - We only store aggregate counts (words, duration, WPM) per\n"
+            "    session and per day.\n"
+            "  - A short in-memory buffer holds the characters of the word you\n"
+            "    are currently typing. It is cleared on every word boundary,\n"
+            "    pause, stop, and app switch. No typed content is cached,\n"
+            "    hashed, or written to disk.\n\n"
+            "What we do NOT do:\n"
+            "  - No cloud uploads. No telemetry. No network calls in v1.\n"
+            "  - No screenshotting, clipboard access, or file scanning.\n"
+            "  - No logging of what you type, in any app, ever.\n\n"
+            "Your allowlist lives in config.json (under %APPDATA%\\WordCounterPro\\).\n"
+            "You can add or remove apps any time from Tools > Writing Apps.\n\n"
+            "The source is open. Audit AppFocusManager, FocusWatcher, and\n"
+            "WordDetector in wordcounter.py to verify every claim above."
+        )
+        body.insert("1.0", statement)
+        body.config(state=tk.DISABLED)
+
+        bottom = ttk.Frame(main)
+        bottom.pack(fill=tk.X, pady=(15, 0))
+        ttk.Button(bottom, text="Close", command=win.destroy).pack(side=tk.RIGHT)
 
     def show_analytics_dashboard(self):
         """Show the comprehensive analytics dashboard."""
@@ -2506,7 +3175,7 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
             "• Achievement system and gamification\n"
             "• Writing streaks and consistency tracking\n"
             "• Social features and challenges\n"
-            "• Security features to protect sensitive data\n"
+            "• Allowlist model: only runs in your writing apps\n"
             "• Comprehensive data export and backup"
         )
 
@@ -2531,11 +3200,205 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
                 pass
             self._daily_goal_save_job = None
         self.data_manager.flush_pending(force=True)
+        try:
+            if hasattr(self, "focus_watcher") and self.focus_watcher is not None:
+                self.focus_watcher.stop()
+        except Exception as e:
+            self.logger.warning(f"Error stopping focus watcher: {e}")
         self.root.destroy()
+
+
+class OnboardingWizard:
+    """Two-screen first-run wizard: intro/privacy, then allowlist + startup."""
+
+    def __init__(self, root: tk.Tk, app: "WordCountApp"):
+        self.root = root
+        self.app = app
+        self.completed = False
+
+        self.win = tk.Toplevel(root)
+        self.win.title("Welcome to WordCounter")
+        self.win.geometry("640x560")
+        self.win.resizable(False, False)
+        self.win.transient(root)
+        self.win.grab_set()
+
+        self.win.update_idletasks()
+        x = (self.win.winfo_screenwidth() // 2) - (640 // 2)
+        y = (self.win.winfo_screenheight() // 2) - (560 // 2)
+        self.win.geometry(f"640x560+{x}+{y}")
+
+        self.win.protocol("WM_DELETE_WINDOW", self._on_x_close)
+
+        self.allowed_vars: Dict[str, tk.BooleanVar] = {}
+        self.custom_apps: List[str] = []
+        self.startup_var = tk.BooleanVar(value=bool(app.config.get("launch_on_startup", False)))
+
+        self.container = ttk.Frame(self.win, padding="24")
+        self.container.pack(fill=tk.BOTH, expand=True)
+
+        self._show_screen1()
+
+    def _clear(self) -> None:
+        for w in self.container.winfo_children():
+            w.destroy()
+
+    def _show_screen1(self) -> None:
+        self._clear()
+
+        ttk.Label(self.container, text="Welcome to WordCounter",
+                  font=("Helvetica", 18, "bold")).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(self.container, text="Step 1 of 2 - What this app does",
+                  foreground="#666").pack(anchor=tk.W, pady=(0, 16))
+
+        bg = self.win.cget("bg")
+        body = tk.Text(self.container, wrap=tk.WORD, height=18, relief=tk.FLAT,
+                       background=bg, borderwidth=0,
+                       font=("Helvetica", 10))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.insert("1.0",
+            "WordCounter tracks your writing productivity by counting words\n"
+            "typed in your writing apps (Obsidian, Microsoft Word, Evernote,\n"
+            "Scrivener, Notepad++, and so on).\n\n"
+            "How this is NOT a keylogger:\n\n"
+            "  - A foreground-window hook watches which app is focused.\n"
+            "  - The keyboard listener is only created while one of your\n"
+            "    allowlisted writing apps is focused. When you alt-tab to\n"
+            "    anything else (Chrome, Slack, your password manager, the\n"
+            "    terminal), the listener is stopped and this process\n"
+            "    receives zero keystrokes.\n\n"
+            "  - Only aggregate counts (words, duration, WPM) are stored.\n"
+            "    The typed word you are in the middle of stays in RAM only\n"
+            "    until the next word boundary, then is discarded.\n\n"
+            "  - No cloud uploads, no telemetry, no network calls.\n\n"
+            "On the next screen you pick which writing apps to track.\n"
+            "You can change the list any time from Tools > Writing Apps.\n"
+        )
+        body.config(state=tk.DISABLED)
+
+        btns = ttk.Frame(self.container)
+        btns.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(btns, text="Cancel", command=self._on_x_close).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Next -", command=self._show_screen2).pack(side=tk.RIGHT)
+
+    def _show_screen2(self) -> None:
+        self._clear()
+
+        ttk.Label(self.container, text="Your writing apps",
+                  font=("Helvetica", 18, "bold")).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(self.container, text="Step 2 of 2 - Pick what to track",
+                  foreground="#666").pack(anchor=tk.W, pady=(0, 16))
+        ttk.Label(self.container,
+                  text="The keyboard listener will only run while one of these is focused.",
+                  wraplength=580, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 12))
+
+        list_frame = ttk.LabelFrame(self.container, text="Default writing apps", padding="10")
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        inner = ttk.Frame(list_frame)
+        inner.pack(fill=tk.BOTH, expand=True)
+
+        existing = {a.lower() for a in self.app.app_focus_manager.get_allowed_apps()}
+        defaults = Config.DEFAULT_ALLOWED_APPS
+
+        col_a = ttk.Frame(inner)
+        col_a.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        col_b = ttk.Frame(inner)
+        col_b.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        half = (len(defaults) + 1) // 2
+        for i, app_name in enumerate(defaults):
+            var = tk.BooleanVar(value=(app_name.lower() in existing) if existing else True)
+            self.allowed_vars[app_name] = var
+            parent = col_a if i < half else col_b
+            ttk.Checkbutton(parent, text=friendly_app_name(app_name),
+                            variable=var).pack(anchor=tk.W, pady=2)
+
+        custom_frame = ttk.LabelFrame(self.container, text="Additional apps", padding="10")
+        custom_frame.pack(fill=tk.X, pady=(12, 0))
+
+        custom_row = ttk.Frame(custom_frame)
+        custom_row.pack(fill=tk.X)
+        self.custom_listbox = tk.Listbox(custom_row, height=3)
+        self.custom_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        custom_buttons = ttk.Frame(custom_row)
+        custom_buttons.pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(custom_buttons, text="Add...", command=self._add_custom, width=12).pack(pady=(0, 4))
+        ttk.Button(custom_buttons, text="Remove", command=self._remove_custom, width=12).pack()
+
+        for extra in sorted(existing - {d.lower() for d in defaults}):
+            self.custom_apps.append(extra)
+            self.custom_listbox.insert(tk.END, friendly_app_name(extra))
+
+        ttk.Checkbutton(self.container,
+                        text="Launch WordCounter when I sign in to Windows",
+                        variable=self.startup_var).pack(anchor=tk.W, pady=(16, 0))
+
+        btns = ttk.Frame(self.container)
+        btns.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(btns, text="< Back", command=self._show_screen1).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Finish", command=self._finish).pack(side=tk.RIGHT)
+
+    def _add_custom(self) -> None:
+        name = simpledialog.askstring("Add writing app",
+                                      "Enter the executable name (e.g., joplin.exe):",
+                                      parent=self.win)
+        if not name:
+            return
+        name = name.strip().lower()
+        if name and not name.endswith(".exe"):
+            name = name + ".exe"
+        if name and name not in self.custom_apps:
+            self.custom_apps.append(name)
+            self.custom_listbox.insert(tk.END, friendly_app_name(name))
+
+    def _remove_custom(self) -> None:
+        sel = self.custom_listbox.curselection()
+        if sel:
+            idx = sel[0]
+            if 0 <= idx < len(self.custom_apps):
+                self.custom_apps.pop(idx)
+            self.custom_listbox.delete(idx)
+
+    def _finish(self) -> None:
+        selected = [name for name, var in self.allowed_vars.items() if var.get()]
+        selected += list(self.custom_apps)
+        if not selected:
+            if not messagebox.askyesno(
+                "Empty allowlist",
+                "You haven't selected any writing apps. WordCounter won't track anything. Continue anyway?",
+                parent=self.win,
+            ):
+                return
+
+        self.app.app_focus_manager.set_allowed_apps(selected)
+
+        want_startup = bool(self.startup_var.get())
+        ok = set_launch_on_startup(want_startup)
+        if not ok:
+            messagebox.showwarning(
+                "Startup setting",
+                "Could not update the Windows startup entry. You can try again later from the Tools menu.",
+                parent=self.win,
+            )
+        self.app.config.set("launch_on_startup", want_startup)
+        self.app.config.set("onboarding_completed", True)
+        self.completed = True
+        self.win.destroy()
+
+    def _on_x_close(self) -> None:
+        if messagebox.askyesno(
+            "Skip setup?",
+            "Skip the wizard and use the default writing-app list?\nYou can always adjust it from Tools > Writing Apps.",
+            parent=self.win,
+        ):
+            self.app.config.set("onboarding_completed", True)
+            self.completed = True
+            self.win.destroy()
 
 
 def main():
     """Main entry point for the application."""
+    install_crash_handlers()
     try:
         root = tk.Tk()
         app = WordCountApp(root)
@@ -2543,7 +3406,14 @@ def main():
         root.mainloop()
     except Exception as e:
         logging.critical(f"Application failed to start: {e}")
-        messagebox.showerror("Critical Error", f"Failed to start application: {e}")
+        log_path = write_crash_log(type(e), e, e.__traceback__)
+        try:
+            msg = f"Failed to start application: {e}"
+            if log_path is not None:
+                msg += f"\n\nA crash log was saved to:\n{log_path}"
+            messagebox.showerror("Critical Error", msg)
+        except Exception:
+            pass
         raise
 
 
