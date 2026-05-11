@@ -2984,11 +2984,62 @@ class WordCountApp:
 
         self.style = ttk.Style()
         self.palette: ThemePalette = LIGHT_PALETTE  # filled in by _apply_theme
+        self._base_font_family: str = "Segoe UI"  # overwritten by _apply_theme
         # Open child windows that should get re-themed on toggle. Weak-ref-ish:
         # entries are dropped when the widget is destroyed.
         self._themed_dialogs: List[Tuple[tk.Misc, Any]] = []
+        # Stat-card widgets we own directly (tk.Frame, not ttk) so we can
+        # re-skin them on dark-mode toggle.
+        self._stat_cards: List[Tuple[tk.Frame, tk.Label, tk.Label]] = []
+        # Matplotlib-backed chart widgets on the main dashboard. Each entry
+        # is a no-arg callable that re-draws the chart against the current
+        # palette; we invoke them whenever the theme flips.
+        self._chart_repaint_fns: List[Any] = []
+        # Live figures referenced by the main window so we can close them
+        # explicitly at shutdown rather than waiting on GC.
+        self._main_figures: List[Figure] = []
 
         self._apply_theme(self.config.get("theme_mode", "light"))
+
+    def _pick_base_font_family(self) -> str:
+        """Pick the best system UI font for this OS.
+
+        On macOS we want SF Pro (the system font) — Tk exposes it as
+        ``.AppleSystemUIFont``, with ``SF Pro Text`` / ``Helvetica Neue`` as
+        backups. On Windows 11 ``Segoe UI Variable`` reads sharper than the
+        legacy ``Segoe UI``. On Linux we fall back to whatever modern UI
+        font is installed. Any miss falls through to ``TkDefaultFont`` so
+        we never crash on a font we can't resolve.
+        """
+        try:
+            from tkinter import font as tkfont
+            available = set(tkfont.families())
+        except Exception:
+            available = set()
+
+        if IS_MACOS:
+            candidates = [
+                ".AppleSystemUIFont",  # the real San Francisco system font
+                "SF Pro Text",
+                "SF Pro Display",
+                "Helvetica Neue",
+                "Helvetica",
+            ]
+        elif IS_WINDOWS:
+            candidates = [
+                "Segoe UI Variable Text",  # Win 11 variable axis
+                "Segoe UI Variable",
+                "Segoe UI",
+                "Tahoma",
+            ]
+        else:
+            candidates = ["Inter", "Cantarell", "Ubuntu", "DejaVu Sans"]
+
+        for fam in candidates:
+            if fam in available:
+                return fam
+        # Tk's own default — guaranteed to resolve on every platform.
+        return "TkDefaultFont"
 
     def _apply_theme(self, mode: str) -> None:
         """Apply a theme mode ('light' / 'dark') to the whole app.
@@ -3021,8 +3072,10 @@ class WordCountApp:
                     except tk.TclError:
                         continue
 
-        # 2. Typography. Segoe UI on Windows, system fallbacks elsewhere.
-        base_family = "Segoe UI"
+        # 2. Typography. Pick the best system font per OS so the app looks
+        # native rather than like a 2010 Windows form on a 2026 Mac.
+        base_family = self._pick_base_font_family()
+        self._base_font_family = base_family
         self.root.option_add("*Font", (base_family, 10))
         self.style.configure(".", font=(base_family, 10))
         self.style.configure("TLabel", font=(base_family, 10))
@@ -3035,6 +3088,14 @@ class WordCountApp:
                              foreground=palette.hero_fg)
         self.style.configure("HeroSub.TLabel", font=(base_family, 10),
                              foreground=palette.hero_sub_fg)
+
+        # Big "today's total" headline — used in the main dashboard.
+        self.style.configure("HeroNumber.TLabel", font=(base_family, 56, "bold"),
+                             foreground=palette.text_primary)
+        self.style.configure("HeroNumberLabel.TLabel", font=(base_family, 11),
+                             foreground=palette.text_muted)
+        self.style.configure("HeroGoal.TLabel", font=(base_family, 10),
+                             foreground=palette.text_subtle)
 
         self.style.configure("StatLabel.TLabel", font=(base_family, 10),
                              foreground=palette.stat_label_fg)
@@ -3056,7 +3117,10 @@ class WordCountApp:
         # On native ttk we hand-paint to get Fluent-ish accent.
         if sv_ttk_applied:
             self.style.configure("Accent.TButton",
-                                 font=(base_family, 10, "bold"),
+                                 font=(base_family, 11, "bold"),
+                                 padding=(18, 10))
+            self.style.configure("TButton",
+                                 font=(base_family, 10),
                                  padding=(14, 8))
         else:
             self.style.configure(
@@ -3109,6 +3173,18 @@ class WordCountApp:
         # tk.Text bodies, listboxes, matplotlib figures).
         self._repaint_themed_widgets()
 
+        # 9. Stat cards are tk.Frame (not ttk) so they can carry a custom
+        # surface background + hairline border. Re-skin them in place.
+        self._repaint_stat_cards()
+
+        # 10. Re-draw matplotlib widgets we own (progress ring, sparkline)
+        # so their colors track light/dark mode.
+        for fn in list(getattr(self, "_chart_repaint_fns", [])):
+            try:
+                fn()
+            except Exception as e:
+                self.logger.debug(f"Chart repaint failed: {e}") if hasattr(self, "logger") else None
+
     # --- Theming helpers for non-ttk widgets ---------------------------
 
     def style_text_widget(self, widget: tk.Text) -> None:
@@ -3138,6 +3214,278 @@ class WordCountApp:
             )
         except tk.TclError:
             pass
+
+    def _make_stat_card(self, parent: tk.Misc, label_text: str,
+                        initial_value: str = "—") -> Tuple[tk.Frame, tk.Label]:
+        """Build one stat card (label on top, big value below) and register it
+        for theme re-skinning. Returns (card_frame, value_label)."""
+        p = self.palette
+        family = self._base_font_family
+        card = tk.Frame(
+            parent,
+            bg=p.surface_bg,
+            highlightbackground=p.border,
+            highlightcolor=p.border,
+            highlightthickness=1,
+            bd=0,
+        )
+        label = tk.Label(
+            card,
+            text=label_text.upper(),
+            bg=p.surface_bg,
+            fg=p.stat_label_fg,
+            font=(family, 9),
+        )
+        label.pack(anchor="w", padx=18, pady=(14, 2))
+        value = tk.Label(
+            card,
+            text=initial_value,
+            bg=p.surface_bg,
+            fg=p.stat_value_fg,
+            font=(family, 26, "bold"),
+        )
+        value.pack(anchor="w", padx=18, pady=(0, 14))
+        self._stat_cards.append((card, label, value))
+        return card, value
+
+    def _repaint_stat_cards(self) -> None:
+        """Re-apply palette colors to every live stat card, dropping any
+        whose underlying widget has been destroyed."""
+        if not getattr(self, "_stat_cards", None):
+            return
+        p = self.palette
+        family = getattr(self, "_base_font_family", "Segoe UI")
+        alive: List[Tuple[tk.Frame, tk.Label, tk.Label]] = []
+        for card, label, value in self._stat_cards:
+            try:
+                if not card.winfo_exists():
+                    continue
+                card.configure(
+                    bg=p.surface_bg,
+                    highlightbackground=p.border,
+                    highlightcolor=p.border,
+                )
+                label.configure(bg=p.surface_bg, fg=p.stat_label_fg,
+                                font=(family, 9))
+                value.configure(bg=p.surface_bg, fg=p.stat_value_fg,
+                                font=(family, 26, "bold"))
+                alive.append((card, label, value))
+            except tk.TclError:
+                continue
+        self._stat_cards = alive
+
+    def _create_progress_ring(self, parent: tk.Misc, size_px: int = 150) -> Any:
+        """Create a donut progress ring sized ``size_px`` square.
+
+        Returns a callable ``update(percent: float, total: int, goal: int)``
+        that re-draws the ring + the centered "78%" / "of goal" text. The
+        ring also auto-registers itself for theme repaint, so dark-mode
+        toggles re-draw without the caller doing anything.
+        """
+        dpi = 100
+        inches = max(1.0, size_px / dpi)
+        fig = Figure(figsize=(inches, inches), dpi=dpi)
+        ax = fig.add_subplot(111, aspect="equal")
+        fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        ax.set_xlim(-1.1, 1.1)
+        ax.set_ylim(-1.1, 1.1)
+        ax.axis("off")
+
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        widget = canvas.get_tk_widget()
+        # Match the surrounding window so the figure corners blend in.
+        widget.configure(bg=self.palette.window_bg, highlightthickness=0, bd=0)
+
+        state: Dict[str, Any] = {"percent": -1.0}
+        self._main_figures.append(fig)
+
+        def _draw(percent: float) -> None:
+            p = self.palette
+            fig.patch.set_facecolor(p.window_bg)
+            ax.set_facecolor(p.window_bg)
+            ax.clear()
+            ax.set_xlim(-1.1, 1.1)
+            ax.set_ylim(-1.1, 1.1)
+            ax.axis("off")
+
+            pct = max(0.0, min(percent, 100.0))
+
+            # Background ring (always full).
+            ax.pie(
+                [100], colors=[p.border], radius=1.0,
+                wedgeprops=dict(width=0.18, edgecolor="none"),
+                startangle=90,
+            )
+            # Foreground arc on top.
+            if pct > 0:
+                wedges = [pct, 100 - pct]
+                ax.pie(
+                    wedges,
+                    colors=[p.accent_bg, "none"],
+                    radius=1.0,
+                    startangle=90,
+                    counterclock=False,
+                    wedgeprops=dict(width=0.18, edgecolor="none"),
+                )
+
+            # Center text: big percentage, small "of goal" caption.
+            ax.text(
+                0, 0.08, f"{pct:.0f}%",
+                ha="center", va="center",
+                color=p.text_primary,
+                fontsize=20, fontweight="bold",
+                family=self._base_font_family,
+            )
+            ax.text(
+                0, -0.22, "of goal",
+                ha="center", va="center",
+                color=p.text_subtle,
+                fontsize=9,
+                family=self._base_font_family,
+            )
+            try:
+                widget.configure(bg=p.window_bg)
+            except tk.TclError:
+                pass
+            canvas.draw_idle()
+
+        def update(percent: float) -> None:
+            # Skip redraws when the rounded percent hasn't shifted; keeps
+            # the once-per-second display tick cheap.
+            rounded = round(percent)
+            if rounded == state["percent"]:
+                return
+            state["percent"] = rounded
+            _draw(percent)
+
+        def repaint() -> None:
+            # Forced repaint on theme toggle even if percent didn't change.
+            _draw(max(0.0, state["percent"] if state["percent"] >= 0 else 0.0))
+
+        self._chart_repaint_fns.append(repaint)
+        _draw(0)
+        return widget, update
+
+    def _last_n_days_words(self, days: int = 7) -> List[Tuple[date, int]]:
+        """Return [(day_date, words_written), ...] for the last ``days`` days,
+        oldest first. The most recent entry includes pending in-memory words
+        so the chart matches the live hero number."""
+        out: List[Tuple[date, int]] = []
+        try:
+            df = self.data_manager.get_all_data(include_pending=True)
+        except Exception:
+            df = None
+
+        today = date.today()
+        # Build a date -> words map from the dataframe.
+        date_totals: Dict[date, int] = {}
+        if df is not None and not df.empty and "Date and Time" in df.columns:
+            for _, row in df.iterrows():
+                try:
+                    raw = row["Date and Time"]
+                    if pd.isna(raw):
+                        continue
+                    if isinstance(raw, str):
+                        d = datetime.fromisoformat(raw).date()
+                    elif isinstance(raw, datetime):
+                        d = raw.date()
+                    else:  # pandas Timestamp
+                        d = raw.to_pydatetime().date()
+                    wc = int(row.get("Word Count", 0) or 0)
+                    date_totals[d] = date_totals.get(d, 0) + wc
+                except Exception:
+                    continue
+
+        for i in range(days - 1, -1, -1):
+            day = today - timedelta(days=i)
+            out.append((day, int(date_totals.get(day, 0))))
+
+        # Fold in the live session's pending words on today's bucket.
+        try:
+            session_count = self.statistics.get_session_data().word_count
+            if out and out[-1][0] == today and session_count:
+                d, total = out[-1]
+                # today_total already includes committed sessions from disk;
+                # add only the uncommitted live session count.
+                out[-1] = (d, total + session_count)
+        except Exception:
+            pass
+        return out
+
+    def _create_weekly_sparkline(self, parent: tk.Misc) -> Any:
+        """Compact 7-day sparkline showing daily word counts. Returns a
+        callable ``update()`` that re-fetches data and re-draws.
+        """
+        fig = Figure(figsize=(6, 1.3), dpi=100)
+        ax = fig.add_subplot(111)
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.18)
+
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        widget = canvas.get_tk_widget()
+        widget.configure(bg=self.palette.surface_bg, highlightthickness=0, bd=0)
+        self._main_figures.append(fig)
+
+        def _draw() -> None:
+            p = self.palette
+            data = self._last_n_days_words(7)
+            counts = [c for _, c in data]
+            labels = [d.strftime("%a") for d, _ in data]
+
+            fig.patch.set_facecolor(p.surface_bg)
+            ax.clear()
+            ax.set_facecolor(p.surface_bg)
+
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            ax.tick_params(axis="x", colors=p.text_subtle, length=0, pad=2,
+                           labelsize=9)
+            ax.tick_params(axis="y", left=False, labelleft=False)
+
+            if any(counts):
+                x = list(range(len(counts)))
+                ax.fill_between(x, counts, alpha=0.18, color=p.accent_bg,
+                                linewidth=0)
+                ax.plot(x, counts, color=p.accent_bg, linewidth=2,
+                        marker="o", markersize=5,
+                        markerfacecolor=p.accent_bg,
+                        markeredgecolor=p.surface_bg, markeredgewidth=1.5)
+                # Annotate today's value.
+                ax.annotate(
+                    f"{counts[-1]:,}",
+                    xy=(len(counts) - 1, counts[-1]),
+                    xytext=(-2, 8), textcoords="offset points",
+                    ha="right", va="bottom",
+                    color=p.text_primary, fontsize=9,
+                    fontweight="bold",
+                    family=self._base_font_family,
+                )
+                ymax = max(counts)
+                ax.set_ylim(0, max(ymax * 1.35, 1))
+            else:
+                ax.text(0.5, 0.5, "No writing yet — start your first session.",
+                        ha="center", va="center", transform=ax.transAxes,
+                        color=p.text_subtle, fontsize=10,
+                        family=self._base_font_family)
+                ax.set_ylim(0, 1)
+                ax.set_xlim(-0.5, 6.5)
+
+            ax.set_xticks(list(range(len(labels))))
+            ax.set_xticklabels(labels, family=self._base_font_family)
+            for tick in ax.get_xticklabels():
+                tick.set_color(p.text_subtle)
+
+            try:
+                widget.configure(bg=p.surface_bg)
+            except tk.TclError:
+                pass
+            canvas.draw_idle()
+
+        def update() -> None:
+            _draw()
+
+        self._chart_repaint_fns.append(_draw)
+        _draw()
+        return widget, update
 
     def register_themed_dialog(self, win: tk.Misc, repaint_fn) -> None:
         """Register a dialog window + a callable(palette) that re-paints it.
@@ -3191,15 +3539,15 @@ class WordCountApp:
     def create_ui(self) -> None:
         """Create the user interface with improved layout."""
         # Main container
-        main_frame = ttk.Frame(self.root, padding=(18, 16, 18, 12))
+        main_frame = ttk.Frame(self.root, padding=(24, 22, 24, 16))
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
 
-        # Hero header
+        # Hero header (app title + tagline)
         header = ttk.Frame(main_frame)
-        header.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 14))
+        header.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 18))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Word Counter Pro", style="Hero.TLabel").grid(
             row=0, column=0, sticky=tk.W
@@ -3210,125 +3558,188 @@ class WordCountApp:
             style="HeroSub.TLabel",
         ).grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
 
-        # Statistics Frame
-        self.create_statistics_frame(main_frame)
-        
-        # Progress Frame
-        self.create_progress_frame(main_frame)
-        
+        # Hero "today's words" block — the focal point of the dashboard.
+        self.create_today_hero(main_frame)
+
+        # Three stat cards: session · WPM · session time.
+        self.create_stat_cards(main_frame)
+
+        # 7-day sparkline.
+        self.create_weekly_section(main_frame)
+
         # Control Frame
         self.create_control_frame(main_frame)
-        
+
         # Status Bar
         self.create_status_bar(main_frame)
-        
+
         # Menu Bar
         self.create_menu_bar()
 
-    def create_statistics_frame(self, parent):
-        """Create the statistics display frame."""
-        stats_frame = ttk.LabelFrame(parent, text="Statistics", padding=(14, 10))
-        stats_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=6)
-        stats_frame.columnconfigure(1, weight=1)
+    def create_today_hero(self, parent):
+        """Big 'words today' number on the left, circular progress ring on
+        the right, goal text + spinbox underneath."""
+        hero = ttk.Frame(parent)
+        hero.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 22))
+        hero.columnconfigure(0, weight=1)
+        hero.columnconfigure(1, weight=0)
 
-        row_pady = (2, 2)
+        # --- Left: headline number + caption ---
+        text_block = ttk.Frame(hero)
+        text_block.grid(row=0, column=0, sticky=(tk.W, tk.N))
 
-        ttk.Label(stats_frame, text="Current session", style="StatLabel.TLabel").grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
+        self.today_count_label = ttk.Label(
+            text_block, text="0", style="HeroNumber.TLabel", anchor=tk.W,
         )
-        self.session_count_label = ttk.Label(stats_frame, text="0 words", style="StatValue.TLabel")
-        self.session_count_label.grid(row=0, column=1, sticky=tk.W, pady=row_pady)
+        self.today_count_label.grid(row=0, column=0, sticky=tk.W)
 
-        ttk.Label(stats_frame, text="Today's total", style="StatLabel.TLabel").grid(
-            row=1, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
-        )
-        self.today_count_label = ttk.Label(stats_frame, text="0 words", style="StatValue.TLabel")
-        self.today_count_label.grid(row=1, column=1, sticky=tk.W, pady=row_pady)
+        ttk.Label(
+            text_block, text="WORDS TODAY", style="HeroNumberLabel.TLabel",
+        ).grid(row=1, column=0, sticky=tk.W, pady=(0, 14))
 
-        ttk.Label(stats_frame, text="Words / minute", style="StatLabel.TLabel").grid(
-            row=2, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
-        )
-        self.wpm_label = ttk.Label(stats_frame, text="0 WPM", style="StatValueMuted.TLabel")
-        self.wpm_label.grid(row=2, column=1, sticky=tk.W, pady=row_pady)
-
-        ttk.Label(stats_frame, text="Session time", style="StatLabel.TLabel").grid(
-            row=3, column=0, sticky=tk.W, padx=(0, 16), pady=row_pady
-        )
-        self.duration_label = ttk.Label(stats_frame, text="00:00:00", style="StatValueMuted.TLabel")
-        self.duration_label.grid(row=3, column=1, sticky=tk.W, pady=row_pady)
-
-    def create_progress_frame(self, parent):
-        """Create the progress display frame."""
-        progress_frame = ttk.LabelFrame(parent, text="Daily Progress", padding="10")
-        progress_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
-        progress_frame.columnconfigure(0, weight=1)
-        
-        # Progress Bar
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(
-            progress_frame,
-            variable=self.progress_var,
-            maximum=100,
-            length=300
-        )
-        self.progress_bar.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
-        
-        # Progress Label
         self.progress_label = ttk.Label(
-            progress_frame, 
-            text=f"0 / {self.daily_goal} words (0%)",
-            style="Stats.TLabel"
+            text_block,
+            text=f"0 / {self.daily_goal:,} goal",
+            style="HeroGoal.TLabel",
         )
-        self.progress_label.grid(row=1, column=0, columnspan=2)
-        
-        # Goal Settings
-        ttk.Label(progress_frame, text="Daily Goal:").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
+        self.progress_label.grid(row=2, column=0, sticky=tk.W)
+
+        # Daily-goal spinbox sits just under the goal text.
+        goal_row = ttk.Frame(text_block)
+        goal_row.grid(row=3, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Label(goal_row, text="Daily goal", style="HeroGoal.TLabel").pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
         self.goal_var = tk.StringVar(value=str(self.daily_goal))
         goal_spinbox = ttk.Spinbox(
-            progress_frame,
+            goal_row,
             from_=100,
             to=10000,
             increment=100,
             textvariable=self.goal_var,
-            width=10,
-            command=self.update_daily_goal
+            width=8,
+            command=self.update_daily_goal,
         )
-        goal_spinbox.grid(row=2, column=1, sticky=tk.W, pady=(10, 0))
+        goal_spinbox.pack(side=tk.LEFT)
+
+        # --- Right: circular progress ring ---
+        # progress_var is kept around so legacy callers / future linear
+        # progress fallbacks still work without breaking; the ring is the
+        # primary visual.
+        self.progress_var = tk.DoubleVar()
+        try:
+            ring_widget, ring_update = self._create_progress_ring(hero, size_px=150)
+            ring_widget.grid(row=0, column=1, sticky=tk.E, padx=(12, 0))
+            self._progress_ring_update = ring_update
+        except Exception as e:
+            self.logger.warning(f"Progress ring init failed: {e}")
+            self._progress_ring_update = None
+            # Fallback: linear bar so users still see goal progress.
+            self.progress_bar = ttk.Progressbar(
+                hero, variable=self.progress_var, maximum=100,
+            )
+            self.progress_bar.grid(row=0, column=1, sticky=(tk.W, tk.E),
+                                   padx=(12, 0))
+
+    def create_weekly_section(self, parent):
+        """Compact 'last 7 days' card with an inline sparkline."""
+        p = self.palette
+        card = tk.Frame(
+            parent,
+            bg=p.surface_bg,
+            highlightbackground=p.border,
+            highlightcolor=p.border,
+            highlightthickness=1,
+            bd=0,
+        )
+        card.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(14, 0))
+
+        title = tk.Label(
+            card, text="LAST 7 DAYS",
+            bg=p.surface_bg, fg=p.stat_label_fg,
+            font=(self._base_font_family, 9),
+        )
+        title.pack(anchor="w", padx=18, pady=(14, 0))
+
+        # Register the card itself for theme re-skinning by piggybacking on
+        # the stat-cards list. The label/value triplet shape is (frame, label,
+        # value); we re-use the value slot for the title label so it gets
+        # re-fonted on theme change.
+        self._stat_cards.append((card, title, title))
+
+        chart_host = tk.Frame(card, bg=p.surface_bg)
+        chart_host.pack(fill="x", expand=True, padx=10, pady=(0, 6))
+
+        try:
+            _widget, update_fn = self._create_weekly_sparkline(chart_host)
+            self._sparkline_update = update_fn
+        except Exception as e:
+            self.logger.warning(f"Sparkline init failed: {e}")
+            self._sparkline_update = None
+            tk.Label(
+                chart_host, text="Chart unavailable",
+                bg=p.surface_bg, fg=p.text_subtle,
+                font=(self._base_font_family, 10),
+            ).pack(padx=18, pady=(0, 14))
+
+    def create_stat_cards(self, parent):
+        """Three side-by-side stat cards: Session · WPM · Session time."""
+        row = ttk.Frame(parent)
+        row.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
+        for col in (0, 1, 2):
+            row.columnconfigure(col, weight=1, uniform="statcards")
+
+        gap = 10
+
+        session_card, self.session_count_label = self._make_stat_card(
+            row, "This session", initial_value="0"
+        )
+        session_card.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S),
+                          padx=(0, gap))
+
+        wpm_card, self.wpm_label = self._make_stat_card(
+            row, "Words / minute", initial_value="0"
+        )
+        wpm_card.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S),
+                      padx=(gap // 2, gap // 2))
+
+        duration_card, self.duration_label = self._make_stat_card(
+            row, "Session time", initial_value="00:00:00"
+        )
+        duration_card.grid(row=0, column=2, sticky=(tk.W, tk.E, tk.N, tk.S),
+                           padx=(gap, 0))
 
     def create_control_frame(self, parent):
         """Create the control buttons frame."""
         control_frame = ttk.Frame(parent)
-        control_frame.grid(row=3, column=0, pady=(18, 10))
+        control_frame.grid(row=4, column=0, pady=(22, 12))
 
-        # Start Button (primary action)
         self.start_button = ttk.Button(
             control_frame,
-            text="▶  Start Recording",
+            text="\u25B6  Start Recording",
             command=self.start_recording,
-            width=20,
+            width=22,
             style="Accent.TButton",
         )
-        self.start_button.grid(row=0, column=0, padx=6)
+        self.start_button.grid(row=0, column=0, padx=8)
 
-        # Pause Button
         self.pause_button = ttk.Button(
             control_frame,
-            text="⏸  Pause",
+            text="\u23F8  Pause",
             command=self.toggle_pause,
             state=tk.DISABLED,
             width=18,
         )
-        self.pause_button.grid(row=0, column=1, padx=6)
+        self.pause_button.grid(row=0, column=1, padx=8)
 
-        # Stop Button
         self.stop_button = ttk.Button(
             control_frame,
-            text="⏹  Stop",
+            text="\u25A0  Stop",
             command=self.stop_recording,
             state=tk.DISABLED,
             width=18,
         )
-        self.stop_button.grid(row=0, column=2, padx=6)
+        self.stop_button.grid(row=0, column=2, padx=8)
 
     def create_status_bar(self, parent):
         """Create the status bar."""
@@ -3339,7 +3750,7 @@ class WordCountApp:
             style="StatusBar.TLabel",
             anchor=tk.W,
         )
-        status_bar.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(12, 0))
+        status_bar.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(12, 0))
 
     def create_menu_bar(self):
         """Create the menu bar."""
@@ -3403,38 +3814,55 @@ class WordCountApp:
 
     def update_display(self):
         """Update all display elements."""
-        # Update session count
         session_data = self.statistics.get_session_data()
         session_count = session_data.word_count
-        self.session_count_label.config(text=f"{session_count} words")
-        
-        # Update today's total
+        self.session_count_label.config(text=f"{session_count:,}")
+
         total = self.today_total + session_count
-        self.today_count_label.config(text=f"{total} words")
-        
-        # Update progress
-        progress = min((total / self.daily_goal) * 100, 100)
+        self.today_count_label.config(text=f"{total:,}")
+
+        progress = min((total / self.daily_goal) * 100, 100) if self.daily_goal else 0
         self.progress_var.set(progress)
-        self.progress_label.config(text=f"{total} / {self.daily_goal} words ({progress:.1f}%)")
-        
-        # Update progress label style based on achievement
+        self.progress_label.config(
+            text=f"{total:,} / {self.daily_goal:,} goal"
+        )
+
         if total >= self.daily_goal:
             self.progress_label.config(style="Success.TLabel")
             self._show_goal_achievement_notification()
         elif progress >= 75:
             self.progress_label.config(style="Warning.TLabel")
         else:
-            self.progress_label.config(style="Stats.TLabel")
-        
-        # Update WPM
+            self.progress_label.config(style="HeroGoal.TLabel")
+
+        # Drive the donut ring (no-op if init failed).
+        ring_update = getattr(self, "_progress_ring_update", None)
+        if ring_update is not None:
+            try:
+                ring_update(progress)
+            except Exception as e:
+                self.logger.debug(f"Ring update failed: {e}")
+
         wpm = self.statistics.get_overall_wpm()
-        self.wpm_label.config(text=f"{wpm:.1f} WPM")
-        
-        # Update duration
+        self.wpm_label.config(text=f"{wpm:.0f}")
+
         duration = self.statistics.get_session_duration()
         hours, remainder = divmod(duration, 3600)
         minutes, seconds = divmod(remainder, 60)
         self.duration_label.config(text=f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+
+        # Sparkline only changes meaningfully when the day rolls over or a
+        # session is committed. Cheap to re-fetch on a tick but we only
+        # redraw every ~30s to avoid hammering matplotlib.
+        now = time.time()
+        last = getattr(self, "_last_sparkline_redraw", 0.0)
+        sparkline_update = getattr(self, "_sparkline_update", None)
+        if sparkline_update is not None and (now - last) > 30:
+            try:
+                sparkline_update()
+                self._last_sparkline_redraw = now
+            except Exception as e:
+                self.logger.debug(f"Sparkline update failed: {e}")
 
     def update_display_timer(self):
         """Timer to update display regularly."""
@@ -3666,6 +4094,16 @@ class WordCountApp:
             self.update_button_states()
             self.update_display()
             self._update_status_bar()
+
+            # A session just landed in the spreadsheet — force the
+            # sparkline to redraw rather than waiting for the 30s tick.
+            self._last_sparkline_redraw = 0.0
+            sparkline_update = getattr(self, "_sparkline_update", None)
+            if sparkline_update is not None:
+                try:
+                    sparkline_update()
+                except Exception as e:
+                    self.logger.debug(f"Sparkline post-save refresh failed: {e}")
 
             self.logger.info("Recording stopped")
             
@@ -4283,6 +4721,14 @@ Productivity Score: {self.statistics.get_productivity_score():.1f}
                 self.focus_watcher.stop()
         except Exception as e:
             self.logger.warning(f"Error stopping focus watcher: {e}")
+        # Close any matplotlib figures the main window owns so Tk can
+        # actually tear the process down on shutdown.
+        for fig in list(getattr(self, "_main_figures", [])):
+            try:
+                plt.close(fig)
+            except Exception:
+                pass
+        self._main_figures.clear() if hasattr(self, "_main_figures") else None
         self.root.destroy()
 
 
