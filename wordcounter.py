@@ -913,6 +913,19 @@ _KNOWN_APPS_WINDOWS: Dict[str, Tuple[str, bool]] = {
     "ia writer.exe":    ("iA Writer",      False),
     "code.exe":         ("VS Code",        False),
     "cursor.exe":       ("Cursor",         False),
+    "windsurf.exe":     ("Windsurf",       False),
+    "zed.exe":          ("Zed",            False),
+    "devenv.exe":       ("Visual Studio",  False),
+    "idea64.exe":       ("IntelliJ IDEA",  False),
+    "pycharm64.exe":    ("PyCharm",        False),
+    "webstorm64.exe":   ("WebStorm",       False),
+    "rider64.exe":      ("JetBrains Rider",False),
+    "goland64.exe":     ("GoLand",         False),
+    "clion64.exe":      ("CLion",          False),
+    "phpstorm64.exe":   ("PhpStorm",       False),
+    "studio64.exe":     ("Android Studio", False),
+    "claude.exe":       ("Claude",         False),
+    "chatgpt.exe":      ("ChatGPT",        False),
 }
 
 _KNOWN_APPS_MACOS: Dict[str, Tuple[str, bool]] = {
@@ -932,6 +945,19 @@ _KNOWN_APPS_MACOS: Dict[str, Tuple[str, bool]] = {
     "notion":              ("Notion",              False),
     "visual studio code":  ("Visual Studio Code",  False),
     "cursor":              ("Cursor",              False),
+    "windsurf":            ("Windsurf",            False),
+    "zed":                 ("Zed",                 False),
+    "intellij idea":       ("IntelliJ IDEA",       False),
+    "pycharm":             ("PyCharm",             False),
+    "webstorm":            ("WebStorm",            False),
+    "rider":               ("JetBrains Rider",     False),
+    "goland":              ("GoLand",              False),
+    "clion":               ("CLion",               False),
+    "phpstorm":            ("PhpStorm",            False),
+    "xcode":               ("Xcode",               False),
+    "android studio":      ("Android Studio",      False),
+    "claude":              ("Claude",              False),
+    "chatgpt":             ("ChatGPT",             False),
 }
 
 _KNOWN_APPS: Dict[str, Tuple[str, bool]] = (
@@ -2229,7 +2255,16 @@ class DataManager:
             try:
                 ts = pd.to_datetime(row['Date and Time'])
                 start_time = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else datetime.fromisoformat(str(ts))
-                dur_sec = float(row.get('Duration (seconds)', 0) or 0)
+                d_raw = row.get('Duration (seconds)', 0)
+                if d_raw is None or (isinstance(d_raw, float) and pd.isna(d_raw)):
+                    dur_sec = 0.0
+                else:
+                    try:
+                        dur_sec = float(d_raw)
+                    except (TypeError, ValueError):
+                        dur_sec = 0.0
+                    if pd.isna(dur_sec) or dur_sec in (float('inf'), float('-inf')):
+                        dur_sec = 0.0
                 dur_min = dur_sec / 60.0
                 end_time = start_time + timedelta(seconds=dur_sec)
                 raw_sid = row.get('Session ID', "")
