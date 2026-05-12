@@ -2467,9 +2467,11 @@ class AnalyticsDashboard:
 
         # Scrollable canvas + vertical scrollbar. We paint the canvas in
         # the palette's window_bg so the area outside the content frame
-        # doesn't flash a default gray in dark mode.
+        # doesn't flash a default gray in dark mode. takefocus=1 so the
+        # canvas's built-in arrow-key bindings fire as a fallback.
         canvas = tk.Canvas(outer, highlightthickness=0,
-                           background=self.palette.window_bg)
+                           background=self.palette.window_bg,
+                           takefocus=1)
         vscroll = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
         canvas.grid(row=0, column=0, sticky='nsew')
@@ -2479,7 +2481,9 @@ class AnalyticsDashboard:
         content_id = canvas.create_window((0, 0), window=content, anchor='nw')
 
         def _sync_scrollregion(_event=None) -> None:
-            canvas.configure(scrollregion=canvas.bbox('all'))
+            bbox = canvas.bbox('all')
+            if bbox:
+                canvas.configure(scrollregion=bbox)
 
         def _match_width(event) -> None:
             # Make the inner frame always fill the canvas horizontally so
@@ -2489,18 +2493,148 @@ class AnalyticsDashboard:
         content.bind('<Configure>', _sync_scrollregion)
         canvas.bind('<Configure>', _match_width)
 
-        # Mouse-wheel scrolling, scoped to the canvas so we don't hijack
-        # scrolling elsewhere in the app.
-        def _on_wheel(event) -> None:
+        # Mouse-wheel + keyboard scrolling.
+        #
+        # The tricky bit: the embedded content frame fully covers the
+        # canvas, so `canvas.bind('<Enter>')` flips on and off as the
+        # mouse moves over child widgets. And per-widget bindings on
+        # matplotlib's FigureCanvasTkAgg get pre-empted by matplotlib's
+        # own internal handlers. The reliable scope is the dashboard's
+        # toplevel window: when the pointer is inside it we activate a
+        # global <MouseWheel> binding via bind_all; when it leaves, we
+        # remove it so we don't hijack scrolling in the main window.
+        # Defensive: any of these handlers can fire after the canvas has
+        # been destroyed (e.g. the bind_all <MouseWheel> binding outlives
+        # the dashboard if the user closes the window mid-scroll). Always
+        # check winfo_exists() and swallow TclError so a stale handler
+        # never crashes the interpreter.
+        def _canvas_alive() -> bool:
+            try:
+                return bool(canvas.winfo_exists())
+            except tk.TclError:
+                return False
+
+        def _scroll_units(amount: int) -> None:
+            if not _canvas_alive():
+                return
+            try:
+                canvas.yview_scroll(amount, 'units')
+            except tk.TclError:
+                pass
+
+        def _scroll_pages(amount: int) -> None:
+            if not _canvas_alive():
+                return
+            try:
+                canvas.yview_scroll(amount, 'pages')
+            except tk.TclError:
+                pass
+
+        def _scroll_to(fraction: float) -> None:
+            if not _canvas_alive():
+                return
+            try:
+                canvas.yview_moveto(fraction)
+            except tk.TclError:
+                pass
+
+        def _on_wheel(event) -> str:
             if sys.platform == 'darwin':
-                canvas.yview_scroll(-int(event.delta), 'units')
+                delta = -int(event.delta)
             else:
-                canvas.yview_scroll(-int(event.delta / 120), 'units')
+                delta = -int(event.delta / 120) if event.delta else 0
+            if delta:
+                _scroll_units(delta)
+            return 'break'
 
-        canvas.bind('<Enter>', lambda _e: canvas.bind_all('<MouseWheel>', _on_wheel))
-        canvas.bind('<Leave>', lambda _e: canvas.unbind_all('<MouseWheel>'))
+        def _on_wheel_linux_up(_event) -> str:
+            _scroll_units(-1)
+            return 'break'
 
+        def _on_wheel_linux_down(_event) -> str:
+            _scroll_units(1)
+            return 'break'
+
+        def _activate_wheel(_event=None) -> None:
+            if not _canvas_alive():
+                return
+            try:
+                canvas.bind_all('<MouseWheel>', _on_wheel)
+                canvas.bind_all('<Button-4>', _on_wheel_linux_up)
+                canvas.bind_all('<Button-5>', _on_wheel_linux_down)
+            except tk.TclError:
+                pass
+
+        def _deactivate_wheel(_event=None) -> None:
+            # Use the root interpreter — canvas may already be destroyed.
+            root = top.tk
+            for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+                try:
+                    root.call('bind', 'all', seq, '')
+                except tk.TclError:
+                    pass
+
+        top = canvas.winfo_toplevel()
+        top.bind('<Enter>', _activate_wheel, add='+')
+        top.bind('<Leave>', _deactivate_wheel, add='+')
+        # FocusIn covers the case where the dashboard already has the
+        # pointer when it opens (Enter never fires on initial show).
+        top.bind('<FocusIn>', _activate_wheel, add='+')
+
+        # The crucial cleanup hook. We MUST NOT bind on <Destroy> here —
+        # that fires during Tk teardown (including from a SIGTERM handler),
+        # which on macOS reliably segfaults the interpreter when a Python
+        # callback runs after PyEval_SaveThread. Instead, wrap
+        # WM_DELETE_WINDOW which only fires for user-initiated close.
+        try:
+            previous_close = top.protocol("WM_DELETE_WINDOW")
+        except tk.TclError:
+            previous_close = ""
+
+        def _on_close() -> None:
+            _deactivate_wheel()
+            if previous_close:
+                try:
+                    top.tk.call(previous_close)
+                    return
+                except tk.TclError:
+                    pass
+            try:
+                top.destroy()
+            except tk.TclError:
+                pass
+
+        top.protocol("WM_DELETE_WINDOW", _on_close)
+
+        # Keyboard scrolling — bound on the toplevel so it works regardless
+        # of which child widget currently has focus.
+        top.bind('<Up>',    lambda _e: _scroll_units(-1))
+        top.bind('<Down>',  lambda _e: _scroll_units( 1))
+        top.bind('<Prior>', lambda _e: _scroll_pages(-1))
+        top.bind('<Next>',  lambda _e: _scroll_pages( 1))
+        top.bind('<Home>',  lambda _e: _scroll_to(0.0))
+        top.bind('<End>',   lambda _e: _scroll_to(1.0))
+        # Spacebar pages down — same as most native scrollable views.
+        top.bind('<space>', lambda _e: _scroll_pages(1))
+
+        # Build content first, then force a layout pass so bbox('all')
+        # returns the real content height. Without this, scrollregion can
+        # be stuck at (0,0,w,0) and the scrollbar shows no thumb.
         self._build_content(content)
+        try:
+            content.update_idletasks()
+            bbox = canvas.bbox('all')
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+        except tk.TclError:
+            pass
+
+        # Give the canvas keyboard focus so the Canvas class's built-in
+        # arrow-key bindings work as another fallback.
+        try:
+            canvas.focus_set()
+        except tk.TclError:
+            pass
         return outer
 
     def _build_content(self, parent: ttk.Frame) -> None:
