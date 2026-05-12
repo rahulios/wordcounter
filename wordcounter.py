@@ -107,14 +107,11 @@ def migrate_legacy_data_to_app_dir(app_dir: Path) -> None:
 
 
 # Application version. Bump before each friends build.
-APP_VERSION = "0.2.0-validate"
+APP_VERSION = "0.2.1-validate"
 
-# TODO: set before distribution.
 # The feedback "Email us" menu item and the crash-report mailto link both
-# resolve to this address. It MUST be replaced with the real inbox before
-# you ship a build to anyone outside the project, otherwise user feedback
-# vanishes into example.com.
-FEEDBACK_EMAIL = "feedback@example.com"
+# resolve to this address.
+FEEDBACK_EMAIL = "1rahulgoyal@gmail.com"
 
 
 def crashes_dir() -> Path:
